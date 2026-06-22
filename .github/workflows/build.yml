@@ -7,6 +7,9 @@ name: Build VCam APK
       branches: [ main, master ]
     workflow_dispatch:
 
+  permissions:
+    contents: write
+
   jobs:
     build:
       name: Build Debug & Release APK
@@ -75,7 +78,7 @@ name: Build VCam APK
             path: app/build/outputs/apk/release/app-release-unsigned.apk
             retention-days: 30
 
-        - name: Create Release
+        - name: Create GitHub Release
           if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
           uses: softprops/action-gh-release@v2
           with:
@@ -85,21 +88,21 @@ name: Build VCam APK
               ## VCam Build ${{ github.run_number }}
               
               ### Download
-              - **Debug APK** (for testing): `app-debug.apk`
-              - **Release APK** (unsigned): `app-release-unsigned.apk`
+              - **Debug APK** (للتثبيت والاختبار): `app-debug.apk`
+              - **Release APK** (غير موقع): `app-release-unsigned.apk`
               
-              ### Requirements
+              ### المتطلبات
               - Android 8.0+ (API 26+)
-              - Rooted Android emulator (Genymotion, LDPlayer, MuMu, etc.)
-              - Root manager (Magisk recommended)
+              - محاكي أندرويد مع روت (Genymotion، LDPlayer، MuMu، وغيرها)
+              - مدير روت (Magisk)
               
-              ### How to use
-              1. Install APK on rooted emulator
-              2. Grant root permission when prompted
-              3. Select image or video to inject
-              4. Choose target app from the list
-              5. Tap Start VCam
-              6. Open target app camera — it will show your image/video
+              ### طريقة الاستخدام
+              1. ثبّت APK على المحاكي المروّت
+              2. امنح صلاحية Root عند الطلب
+              3. اختر صورة أو فيديو للحقن
+              4. اختر التطبيق المستهدف من القائمة
+              5. اضغط **Start VCam**
+              6. افتح كاميرا التطبيق المستهدف — ستظهر صورتك/فيديوك
             files: |
               app/build/outputs/apk/debug/app-debug.apk
               app/build/outputs/apk/release/app-release-unsigned.apk
