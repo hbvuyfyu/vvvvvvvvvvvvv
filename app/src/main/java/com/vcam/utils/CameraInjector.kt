@@ -10,6 +10,22 @@ package com.vcam.utils
   import kotlinx.coroutines.launch
   import java.io.File
 
+  /**
+   * CameraInjector — injects a JPEG/video into the target app's camera feed.
+   *
+   * PRIMARY strategy (Android 8+, rooted):
+   *   1. Copy libvcam_inject.so → /data/local/tmp/
+   *   2. Push source image      → /data/local/tmp/vcam/source.jpg
+   *   3. setprop wrap.<pkg>       "LD_PRELOAD=/data/local/tmp/libvcam_inject.so"
+   *   4. am force-stop <pkg> + am start  →  app relaunches with our hook loaded
+   *
+   * FALLBACK strategy:
+   *   v4l2loopback + ffmpeg (if v4l2 devices are available)
+   *
+   * The hook library (libvcam_inject.so) overrides hw_get_module_by_class() so
+   * any Camera1-API call inside the target process opens our fake camera HAL,
+   * which continuously delivers frames read from /data/local/tmp/vcam/source.jpg.
+   */
   class CameraInjector(
       private val context: Context,
       private val mediaPath: String,
@@ -18,13 +34,12 @@ package com.vcam.utils
   ) {
       companion object {
           private const val TAG = "CameraInjector"
+          private const val VCAM_DIR  = "/data/local/tmp/vcam"
+          private const val INJECT_LIB = "/data/local/tmp/libvcam_inject.so"
 
           init {
-              try {
-                  System.loadLibrary("vcam_native")
-              } catch (e: UnsatisfiedLinkError) {
-                  Log.w(TAG, "Native library not loaded (non-fatal): ${e.message}")
-              }
+              try { System.loadLibrary("vcam_native") }
+              catch (e: UnsatisfiedLinkError) { Log.w(TAG, "vcam_native not loaded: ${e.message}") }
           }
 
           @JvmStatic external fun nativeInjectImage(imagePath: String, videoDevice: String): Int
@@ -45,8 +60,8 @@ package com.vcam.utils
       fun stop() {
           running = false
           injectionJob?.cancel()
+          targetPackage?.let { cleanupWrapProp(it) }
           try { nativeStopInjection() } catch (_: Exception) {}
-          // Kill any background injection processes
           RootManager.runCommands(
               "pkill -f ffmpeg 2>/dev/null || true",
               "pkill -f v4l2 2>/dev/null || true"
@@ -54,243 +69,147 @@ package com.vcam.utils
           Log.d(TAG, "VCam stopped")
       }
 
+      // ── Primary injection: LD_PRELOAD hook ────────────────────────────────
+
+      private fun injectViaLdPreload(pkg: String): Boolean {
+          Log.d(TAG, "Attempting LD_PRELOAD injection for: $pkg")
+
+          // 1. Locate libvcam_inject.so inside our app's native lib directory
+          val nativeLibDir = context.applicationInfo.nativeLibraryDir
+          val srcLib = File(nativeLibDir, "libvcam_inject.so")
+          if (!srcLib.exists()) {
+              Log.e(TAG, "libvcam_inject.so not found in $nativeLibDir")
+              return false
+          }
+
+          // 2. Push library + image to /data/local/tmp/
+          RootManager.runCommands(
+              "mkdir -p $VCAM_DIR",
+              "cp '${srcLib.absolutePath}' $INJECT_LIB",
+              "chmod 755 $INJECT_LIB"
+          )
+
+          // 3. Copy source image to vcam dir
+          val destImage = "$VCAM_DIR/source.jpg"
+          RootManager.runCommands(
+              "cp '$mediaPath' '$destImage' 2>/dev/null || true",
+              "chmod 644 '$destImage'"
+          )
+          // Write config file (image path)
+          RootManager.runCommand("echo '$mediaPath' > $VCAM_DIR/vcam_config")
+
+          // 4. Disable SELinux temporarily so LD_PRELOAD works
+          RootManager.runCommand("setenforce 0 2>/dev/null || true")
+
+          // 5. Set the wrap property — Zygote will LD_PRELOAD our lib when pkg launches
+          val wrapProp = "wrap.$pkg"
+          val propVal  = "LD_PRELOAD=$INJECT_LIB"
+          val setResult = RootManager.runCommand("setprop '$wrapProp' '$propVal'")
+          Log.d(TAG, "setprop result: $setResult")
+
+          // Verify the prop was set
+          val verify = RootManager.runCommand("getprop '$wrapProp'")
+          Log.d(TAG, "getprop verify: $verify")
+          if (!verify.contains("LD_PRELOAD")) {
+              Log.w(TAG, "setprop may not have worked; trying alternative")
+              // Try via su -c
+              RootManager.runCommand("su -c "setprop '$wrapProp' '$propVal'"")
+          }
+
+          // 6. Force-stop target app so it relaunches clean with our hook
+          RootManager.runCommand("am force-stop $pkg")
+          Thread.sleep(500)
+
+          // 7. Re-launch target app
+          val launchCmd = "monkey -p $pkg -c android.intent.category.LAUNCHER 1 2>/dev/null || " +
+                          "am start -n $(pm dump $pkg | grep 'android.intent.action.MAIN' -A 2 | " +
+                          "grep 'cmp=' | head -1 | sed 's/.*cmp=\(.*\) .*/\1/') 2>/dev/null || true"
+          RootManager.runCommand(launchCmd)
+
+          Log.d(TAG, "LD_PRELOAD injection done. Check logcat for 'VCamInject' tag.")
+          return true
+      }
+
+      private fun cleanupWrapProp(pkg: String) {
+          val wrapProp = "wrap.$pkg"
+          RootManager.runCommand("setprop '$wrapProp' '' 2>/dev/null || true")
+          RootManager.runCommand("setenforce 1 2>/dev/null || true")
+          Log.d(TAG, "Cleaned up wrap prop for $pkg")
+      }
+
+      // ── V4L2 fallback ─────────────────────────────────────────────────────
+
       private suspend fun performInjection() {
           if (!RootManager.isRooted()) {
-              Log.e(TAG, "Root not available — cannot inject")
-              return
+              Log.e(TAG, "Root not available — cannot inject"); return
           }
 
-          targetPackage?.let { setupTargetApp(it) }
+          // PRIMARY: LD_PRELOAD hook
+          if (!targetPackage.isNullOrBlank()) {
+              val ok = injectViaLdPreload(targetPackage)
+              if (ok) {
+                  // Keep service alive; the hook runs inside the target app
+                  while (running) { delay(2000) }
+                  return
+              }
+              Log.w(TAG, "LD_PRELOAD failed, falling back to v4l2")
+          }
 
-          // Detect emulator type and choose strategy
-          val strategy = detectBestStrategy()
-          Log.d(TAG, "Using injection strategy: $strategy")
+          // FALLBACK: V4L2 loopback
+          tryLoadV4L2Module()
+          val devices = RootManager.getVideoDevices()
+          if (devices.isEmpty()) {
+              Log.e(TAG, "No v4l2 devices and LD_PRELOAD failed — injection not possible"); return
+          }
 
-          when (strategy) {
-              Strategy.V4L2_LOOPBACK -> strategyV4L2()
-              Strategy.FFMPEG_V4L2   -> strategyFfmpegV4L2()
-              Strategy.HAL_BIND_MOUNT -> strategyHalBindMount()
-              Strategy.EMULATOR_PROP  -> strategyEmulatorProp()
-              Strategy.NATIVE_ONLY    -> strategyNative()
+          val device = devices.last()
+          Log.d(TAG, "V4L2 fallback: using $device")
+          val ffmpeg = findBinary("ffmpeg")
+          if (ffmpeg != null) {
+              strategyFfmpegV4L2(ffmpeg, device)
+          } else {
+              strategyNativeV4L2(device)
           }
       }
 
-      private enum class Strategy {
-          V4L2_LOOPBACK, FFMPEG_V4L2, HAL_BIND_MOUNT, EMULATOR_PROP, NATIVE_ONLY
-      }
-
-      private fun detectBestStrategy(): Strategy {
-          // 1. Check if v4l2 device already exists (real device or loopback loaded)
-          val v4l2Devices = RootManager.getVideoDevices()
-          if (v4l2Devices.isNotEmpty()) {
-              val ffmpeg = findBinary("ffmpeg")
-              return if (ffmpeg != null) Strategy.FFMPEG_V4L2 else Strategy.V4L2_LOOPBACK
-          }
-
-          // 2. Try to load v4l2loopback kernel module
+      private fun tryLoadV4L2Module() {
           RootManager.runCommands(
               "modprobe v4l2loopback devices=1 video_nr=10 card_label=VCam exclusive_caps=1 2>/dev/null || true",
               "insmod /vendor/lib/modules/v4l2loopback.ko devices=1 2>/dev/null || true",
-              "insmod /system/lib/modules/v4l2loopback.ko devices=1 2>/dev/null || true"
+              "insmod /system/lib/modules/v4l2loopback.ko devices=1 2>/dev/null || true",
+              "insmod /system/lib64/modules/v4l2loopback.ko devices=1 2>/dev/null || true"
           )
-          if (RootManager.getVideoDevices().isNotEmpty()) {
-              val ffmpeg = findBinary("ffmpeg")
-              return if (ffmpeg != null) Strategy.FFMPEG_V4L2 else Strategy.V4L2_LOOPBACK
-          }
-
-          // 3. Check for goldfish/ranchu emulator (Android Studio AVD)
-          val isGoldfish = File("/system/lib/hw/camera.goldfish.so").exists() ||
-                           File("/system/lib64/hw/camera.goldfish.so").exists() ||
-                           File("/vendor/lib/hw/camera.ranchu.so").exists() ||
-                           File("/vendor/lib64/hw/camera.ranchu.so").exists()
-          if (isGoldfish) return Strategy.EMULATOR_PROP
-
-          // 4. Try HAL bind mount (LDPlayer, MuMu, Genymotion)
-          return Strategy.HAL_BIND_MOUNT
       }
 
-      /** Strategy 1: Write raw frames to v4l2 loopback device via native library */
-      private suspend fun strategyV4L2() {
-          val device = RootManager.getVideoDevices().firstOrNull() ?: return
-          Log.d(TAG, "V4L2 strategy: writing to $device")
-          try {
-              // Set permissions on device
-              RootManager.runCommand("chmod 666 $device")
-              if (isVideo) {
-                  nativeInjectVideo(mediaPath, device)
-              } else {
-                  nativeInjectImage(mediaPath, device)
-              }
-          } catch (e: Exception) {
-              Log.e(TAG, "V4L2 native failed: ${e.message}")
-              // Fallback: loop via shell
-              while (running) {
-                  RootManager.runCommand("cat '$mediaPath' > $device 2>/dev/null || true")
-                  delay(33)
-              }
-          }
-      }
-
-      /** Strategy 2: ffmpeg writes frames to v4l2 device (most compatible) */
-      private fun strategyFfmpegV4L2() {
-          val device = RootManager.getVideoDevices().firstOrNull() ?: return
-          val ffmpeg = findBinary("ffmpeg") ?: return
-          Log.d(TAG, "ffmpeg strategy: $ffmpeg -> $device")
-          RootManager.runCommand("chmod 666 $device 2>/dev/null || true")
-
+      private suspend fun strategyFfmpegV4L2(ffmpeg: String, device: String) {
           val cmd = if (isVideo) {
-              "$ffmpeg -re -stream_loop -1 -i '$mediaPath' -f v4l2 -vcodec rawvideo -pix_fmt yuv420p $device 2>/dev/null &"
+              "$ffmpeg -stream_loop -1 -re -i '$mediaPath' -f v4l2 $device"
           } else {
-              "$ffmpeg -re -loop 1 -i '$mediaPath' -f v4l2 -vcodec rawvideo -pix_fmt yuv420p $device 2>/dev/null &"
+              "$ffmpeg -re -loop 1 -i '$mediaPath' -vf scale=640:480 -f v4l2 $device"
           }
-          RootManager.runCommand(cmd)
+          Log.d(TAG, "ffmpeg: $cmd")
+          val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+          while (running && isActive) { delay(500) }
+          proc.destroy()
       }
 
-      /**
-       * Strategy 3: HAL Bind Mount for non-goldfish emulators (LDPlayer, MuMu, Genymotion)
-       * Replaces camera HAL with our custom wrapper that reads from a FIFO pipe.
-       * Our VCamService writes frames to /data/local/tmp/vcam_fifo.
-       */
-      private fun strategyHalBindMount() {
-          Log.d(TAG, "HAL bind mount strategy")
-
-          // Create FIFO pipe for frame delivery
-          val fifoPath = "/data/local/tmp/vcam_fifo"
-          RootManager.runCommands(
-              "rm -f $fifoPath 2>/dev/null || true",
-              "mkfifo $fifoPath",
-              "chmod 666 $fifoPath"
-          )
-
-          // Write our media file path as a config file that the HAL wrapper reads
-          val configPath = "/data/local/tmp/vcam_config"
-          RootManager.runCommands(
-              "echo '$mediaPath' > $configPath",
-              "echo '${if (isVideo) "video" else "image"}' >> $configPath",
-              "chmod 644 $configPath"
-          )
-
-          // Find camera HAL libraries
-          val halPaths = listOf(
-              "/vendor/lib/hw/android.hardware.camera.provider@2.7-impl.so",
-              "/vendor/lib64/hw/android.hardware.camera.provider@2.7-impl.so",
-              "/vendor/lib/hw/camera.default.so",
-              "/vendor/lib64/hw/camera.default.so",
-              "/system/lib/hw/camera.default.so",
-              "/system/lib64/hw/camera.default.so"
-          )
-          val halPath = halPaths.firstOrNull { File(it).exists() }
-
-          if (halPath != null) {
-              Log.d(TAG, "Found camera HAL at $halPath")
-              // Remount vendor/system as rw to allow bind mount
-              val halDir = File(halPath).parent ?: return
-              RootManager.runCommands(
-                  "mount -o remount,rw ${halDir.substringBefore("/hw")} 2>/dev/null || true"
-              )
+      private suspend fun strategyNativeV4L2(device: String) {
+          scope.launch(Dispatchers.IO) {
+              if (isVideo) nativeInjectVideo(mediaPath, device)
+              else nativeInjectImage(mediaPath, device)
           }
-
-          // Push frames via shell using dd loop (works without ffmpeg)
-          startShellFrameLoop(fifoPath)
-      }
-
-      /**
-       * Strategy 4: Goldfish/Ranchu emulator property trick
-       * Configure the virtual camera via emulator properties
-       */
-      private fun strategyEmulatorProp() {
-          Log.d(TAG, "Emulator property strategy (goldfish/ranchu)")
-
-          // Write the media file path into shared memory area the emulator camera reads
-          val vcamDir = "/data/local/tmp/vcam"
-          RootManager.runCommands(
-              "mkdir -p $vcamDir",
-              "chmod 777 $vcamDir"
-          )
-
-          // Copy media to known location
-          val destName = if (isVideo) "source.mp4" else "source.jpg"
-          val destPath = "$vcamDir/$destName"
-          RootManager.runCommand("cp '$mediaPath' $destPath && chmod 644 $destPath")
-
-          // Set emulator camera properties
-          RootManager.runCommands(
-              "setprop qemu.sf.fake_camera emulated 2>/dev/null || true",
-              "setprop persist.camera.input.path $destPath 2>/dev/null || true",
-              "setprop debug.camera.forcebus 0 2>/dev/null || true"
-          )
-
-          // On goldfish, the webcam video device is /dev/video0 mapped to host
-          // Try to write directly using the emulator control socket
-          val emulatorSocket = "/dev/socket/qemud"
-          if (File(emulatorSocket).exists()) {
-              Log.d(TAG, "Found emulator control socket, using it")
-              RootManager.runCommand(
-                  "echo 'camera set source $destPath' | nc -U $emulatorSocket 2>/dev/null || true"
-              )
-          }
-
-          // Also try the AVD webcam device if it exists
-          val webcamDevices = RootManager.runCommand("ls /dev/video* 2>/dev/null")
-          if (webcamDevices.output.isNotBlank()) {
-              val device = webcamDevices.output.trim().split("\n").first()
-              Log.d(TAG, "Found webcam device $device, injecting frames")
-              startShellFrameLoop(device)
-          }
-      }
-
-      /** Strategy 5: Pure native injection as last resort */
-      private suspend fun strategyNative() {
-          Log.d(TAG, "Native-only strategy (last resort)")
-          // Try all known video device paths
-          val devicesToTry = listOf("/dev/video0", "/dev/video1", "/dev/video10")
-          for (device in devicesToTry) {
-              if (File(device).exists()) {
-                  RootManager.runCommand("chmod 666 $device 2>/dev/null || true")
-                  try {
-                      if (isVideo) nativeInjectVideo(mediaPath, device)
-                      else nativeInjectImage(mediaPath, device)
-                      return
-                  } catch (_: Exception) {}
-              }
-          }
-          Log.e(TAG, "No injection method worked on this emulator")
-      }
-
-      /** Push image frames in a loop using shell commands (no ffmpeg needed) */
-      private fun startShellFrameLoop(dest: String) {
-          scope.launch {
-              val file = File(mediaPath)
-              if (!file.exists()) return@launch
-
-              Log.d(TAG, "Shell frame loop -> $dest")
-              while (running) {
-                  if (File(dest).exists()) {
-                      // Write frame data to destination
-                      RootManager.runCommand("cat '$mediaPath' > '$dest' 2>/dev/null || true")
-                  }
-                  delay(if (isVideo) 33L else 500L)
-              }
-          }
-      }
-
-      private fun setupTargetApp(packageName: String) {
-          RootManager.runCommands(
-              "appops set $packageName CAMERA allow 2>/dev/null || true",
-              "pm grant $packageName android.permission.CAMERA 2>/dev/null || true"
-          )
-          Log.d(TAG, "Target app $packageName configured")
+          while (running) { delay(1000) }
+          nativeStopInjection()
       }
 
       private fun findBinary(name: String): String? {
-          val paths = listOf(
-              "/system/bin/$name", "/system/xbin/$name",
-              "/data/local/tmp/$name", "/sbin/$name",
-              "/vendor/bin/$name"
-          )
-          for (path in paths) { if (File(path).exists()) return path }
-          val result = RootManager.runCommand("which $name 2>/dev/null")
-          return if (result.success && result.output.isNotBlank()) result.output.trim() else null
+          val paths = listOf("/system/bin", "/system/xbin", "/data/local/tmp",
+                             "/sbin", "/vendor/bin", "/data/data/jackpal.androidterm/bin")
+          for (dir in paths) {
+              val f = File(dir, name)
+              if (f.exists() && f.canExecute()) return f.absolutePath
+          }
+          return null
       }
   }
   
