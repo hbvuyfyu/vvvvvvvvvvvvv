@@ -78,23 +78,11 @@ package com.vcam.viewmodel
           _isVideo.value = mimeType?.startsWith("video/") == true
       }
 
-      fun clearMedia() {
-          _mediaUri.value = null
-          _isVideo.value = false
-      }
-
+      fun clearMedia() { _mediaUri.value = null; _isVideo.value = false }
       fun setServiceRunning(running: Boolean) { _isServiceRunning.value = running }
 
-      fun filterApps(query: String) {
-          currentFilter = query
-          applyFilters()
-      }
-
-      fun setAppFilter(chipId: Int?) {
-          chipFilter = chipId
-          applyFilters()
-      }
-
+      fun filterApps(query: String) { currentFilter = query; applyFilters() }
+      fun setAppFilter(chipId: Int?) { chipFilter = chipId; applyFilters() }
       fun clearError() { _errorMessage.value = null }
 
       private fun applyFilters() {
@@ -108,8 +96,8 @@ package com.vcam.viewmodel
           }
 
           when (chipFilter) {
-              R.id.chipCamera -> filtered = filtered.filter { it.useCamera }
-              R.id.chipUser   -> filtered = filtered.filter { !it.isSystem }
+              R.id.chip_camera -> filtered = filtered.filter { it.useCamera }
+              R.id.chip_user   -> filtered = filtered.filter { !it.isSystem }
           }
 
           _filteredApps.value = filtered
