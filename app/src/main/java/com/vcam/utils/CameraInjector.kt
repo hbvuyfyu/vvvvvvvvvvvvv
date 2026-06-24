@@ -13,15 +13,14 @@ package com.vcam.utils
    * CameraInjector
    *
    * PRIMARY (rooted Android 8+):
-   *   1. Copy libvcam_inject.so to /data/local/tmp/
-   *   2. Copy source image to /data/local/tmp/vcam/source.jpg
-   *   3. setprop wrap.<pkg>  LD_PRELOAD=/data/local/tmp/libvcam_inject.so
-   *   4. am force-stop <pkg>  — kill current instance
-   *   5. am start <launcher>  — relaunch; camera calls now intercepted by hook
+   *   1. Copy libvcam_inject.so  -> /data/local/tmp/libvcam_inject.so
+   *   2. Copy source image       -> /data/local/tmp/vcam/source.jpg
+   *   3. setprop wrap.<pkg>         LD_PRELOAD=...
+   *   4. am force-stop <pkg>
+   *   5. auto-relaunch the app (camera calls now intercepted by hook)
    *
-   * The hook ONLY intercepts camera hardware requests; all other hardware
-   * calls (sensors, display, etc.) are forwarded to the real system, so
-   * the target app runs normally.
+   * The hook ONLY intercepts camera HAL; all other hardware calls
+   * (sensors, display, etc.) pass through to the real implementation.
    */
   class CameraInjector(
       private val context: Context,
@@ -77,12 +76,11 @@ package com.vcam.utils
               Log.e(TAG, "libvcam_inject.so not found in $nativeLibDir"); return false
           }
 
-          // Push library + image
+          // Push library and image
           RootManager.runCommands(
               "mkdir -p $VCAM_DIR",
               "cp '${srcLib.absolutePath}' $INJECT_LIB",
-              "chmod 755 $INJECT_LIB",
-              "chcon u:object_r:system_file:s0 $INJECT_LIB 2>/dev/null || true"
+              "chmod 755 $INJECT_LIB"
           )
           RootManager.runCommands(
               "cp '$mediaPath' '$VCAM_DIR/source.jpg' 2>/dev/null || true",
@@ -93,38 +91,61 @@ package com.vcam.utils
           // Relax SELinux
           RootManager.runCommand("setenforce 0 2>/dev/null || true")
 
-          // Set wrap property
+          // Set wrap property (Zygote reads it on next app start)
           val wrapProp = "wrap.$pkg"
           val propVal  = "LD_PRELOAD=$INJECT_LIB"
           RootManager.runCommand("setprop '$wrapProp' '$propVal'")
           RootManager.runCommand("resetprop '$wrapProp' '$propVal' 2>/dev/null || true")
 
           val v = RootManager.runCommand("getprop '$wrapProp'")
-          Log.d(TAG, "wrap prop: '${v.output}'")
+          Log.d(TAG, "wrap prop verified: '${v.output}'")
 
-          // Kill and relaunch
+          // Force-stop then relaunch
           RootManager.runCommand("am force-stop $pkg")
-          Thread.sleep(1500)  // wait until fully stopped
+          Thread.sleep(1500)
           launchApp(pkg)
 
           return true
       }
 
-      /** Multi-strategy app launcher */
+      /**
+       * Relaunch the target app using multiple strategies.
+       * Each strategy is a separate shell command — no complex inline scripts.
+       */
       private fun launchApp(pkg: String) {
-          // Strategy A: am start with launcher intent (most reliable)
-          val launchCmd =
-              "COMP=$(cmd package resolve-activity --brief -a android.intent.action.MAIN" +
-              " -c android.intent.category.LAUNCHER $pkg 2>/dev/null | grep '/' | head -1);" +
-              " if [ -n "\$COMP" ]; then am start -n "\$COMP"; else" +
-              " monkey -p $pkg -c android.intent.category.LAUNCHER 1; fi"
-          val r = RootManager.runCommand(launchCmd)
-          Log.d(TAG, "launch result: success=${r.success} out=${r.output}")
-
-          // Fallback: plain monkey
-          if (!r.success) {
-              RootManager.runCommand("monkey -p $pkg -c android.intent.category.LAUNCHER 1 2>/dev/null")
+          // Strategy A: resolve launcher activity via pm, then am start
+          val resolved = RootManager.runCommand(
+              "pm resolve-activity --brief -a android.intent.action.MAIN" +
+              " -c android.intent.category.LAUNCHER $pkg 2>/dev/null | grep '/' | head -1"
+          )
+          val comp = resolved.output.trim()
+          if (comp.contains("/")) {
+              val r = RootManager.runCommand("am start -n $comp 2>/dev/null")
+              if (r.success) {
+                  Log.d(TAG, "Launched via am start -n $comp"); return
+              }
           }
+
+          // Strategy B: monkey (fires a LAUNCHER intent for the package)
+          val r2 = RootManager.runCommand(
+              "monkey -p $pkg -c android.intent.category.LAUNCHER 1 2>/dev/null"
+          )
+          if (r2.success) {
+              Log.d(TAG, "Launched via monkey"); return
+          }
+
+          // Strategy C: cmd package resolve-activity (newer Android versions)
+          val resolved2 = RootManager.runCommand(
+              "cmd package resolve-activity --brief -a android.intent.action.MAIN" +
+              " -c android.intent.category.LAUNCHER $pkg 2>/dev/null | tail -1"
+          )
+          val comp2 = resolved2.output.trim()
+          if (comp2.contains("/")) {
+              RootManager.runCommand("am start -n $comp2 2>/dev/null")
+              Log.d(TAG, "Launched via cmd package / am start -n $comp2"); return
+          }
+
+          Log.w(TAG, "All launch strategies failed for $pkg")
       }
 
       private fun cleanupWrapProp(pkg: String) {
@@ -144,7 +165,7 @@ package com.vcam.utils
               return
           }
 
-          // No target package → v4l2 fallback
+          // No target package: v4l2 fallback
           tryLoadV4L2Module()
           val devices = RootManager.getVideoDevices()
           if (devices.isEmpty()) { Log.e(TAG, "No v4l2 devices"); return }
