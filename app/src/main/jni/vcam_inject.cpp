@@ -207,6 +207,9 @@ static void* preview_thread_fn(void* arg) {
     return NULL;
 }
 
+/* ── Forward declarations ────────────────────────────────────────────── */
+static void fake_stop_preview(struct camera_device* dev);
+
 /* ── Fake device close ───────────────────────────────────────────────── */
 static int fake_device_close(struct hw_device_t* device) {
     if (!device) return 0;
