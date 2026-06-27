@@ -1,38 +1,44 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">VCam</string>
-    <string name="root_access">Root Access</string>
-    <string name="root_granted">✓ Root Granted — Ready</string>
-    <string name="root_denied">✗ Root Denied — Please grant root</string>
+    <string name="app_name">Virtual Cam</string>
+
+    <!-- Code gate -->
+    <string name="code_gate_title">Virtual Cam</string>
+    <string name="code_gate_subtitle">Enter your access code to continue</string>
+    <string name="code_hint">Access code</string>
+    <string name="btn_enter">Unlock</string>
+    <string name="code_invalid">Invalid or expired code. Please try again.</string>
+    <string name="code_checking">Verifying…</string>
+    <string name="code_revoked">Your access has been revoked.</string>
+    <string name="no_internet">No internet connection. Cannot verify code.</string>
+
+    <!-- Main screen -->
+    <string name="root_access">Root Status</string>
+    <string name="root_granted">Rooted ✓</string>
+    <string name="root_denied">Root Not Granted</string>
     <string name="checking">Checking…</string>
-    <string name="select_media">1. Select Image or Video</string>
-    <string name="pick_image">📷 Image</string>
-    <string name="pick_video">🎬 Video</string>
-    <string name="media_selected">Media loaded ✓</string>
-    <string name="media_preview">Media preview</string>
-    <string name="clear">Clear</string>
-    <string name="type_label">Filter:</string>
-    <string name="all_apps">All</string>
-    <string name="camera_apps">Camera Apps</string>
-    <string name="user_apps">User Apps</string>
-    <string name="target_app">2. Select Target App (optional)</string>
-    <string name="search_apps">Search apps…</string>
-    <string name="no_apps">No apps found</string>
-    <string name="app_icon">App icon</string>
-    <string name="camera_badge">📷</string>
-    <string name="start_vcam">▶ Start VCam</string>
-    <string name="stop_vcam">⏹ Stop VCam</string>
-    <string name="permissions_required">Permissions required to continue</string>
-    <string name="select_media_first">Please select an image or video first</string>
-    <string name="no_target_app">No target app selected</string>
-    <string name="no_target_app_message">No target app selected.\n\nVCam will inject into ALL camera apps system-wide (cameraserver hook + v4l2loopback).\n\nMake sure root is granted. Continue?</string>
-    <string name="start_anyway">Start System-Wide</string>
-    <string name="overlay_permission_title">Overlay Permission Needed</string>
-    <string name="overlay_permission_msg">VCam needs \"Draw over other apps\" permission to show the floating control window. Grant it now?</string>
+    <string name="pick_image">Upload Image</string>
+    <string name="pick_video">Upload Video</string>
+    <string name="media_selected">Media ready ✓</string>
+    <string name="media_preview">Preview</string>
+    <string name="clear">✕</string>
+    <string name="start_vcam">▶  Start</string>
+    <string name="stop_vcam">■  Stop</string>
+    <string name="select_media_first">Select an image or video first</string>
+    <string name="injection_active">Injection active — open any camera app</string>
+    <string name="overlay_permission_title">Overlay Permission</string>
+    <string name="overlay_permission_msg">Allow "Draw over other apps" to show the floating control window.</string>
     <string name="grant">Grant</string>
     <string name="skip">Skip</string>
-    <string name="injection_active">Injection Active</string>
-    <string name="open_target_hint">Open the target app now — camera will show your media</string>
-    <string name="system_wide_hint">System-wide active — open any camera app</string>
-    <string name="float_window_hint">Use the floating window to rotate/mirror/stop</string>
+    <string name="permissions_required">Storage permission is required</string>
+    <string name="app_name_label">Virtual Cam</string>
+
+    <!-- Notification -->
+    <string name="notif_title">Virtual Cam — Active</string>
+    <string name="notif_stop">Stop</string>
+
+    <!-- Float window -->
+    <string name="float_rotate">Rotate</string>
+    <string name="float_mirror">Mirror</string>
+    <string name="float_stop">Stop</string>
 </resources>

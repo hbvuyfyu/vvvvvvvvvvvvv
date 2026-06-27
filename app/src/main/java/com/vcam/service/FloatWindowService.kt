@@ -12,58 +12,46 @@ import com.vcam.R
 import com.vcam.ui.MainActivity
 
 /**
- * FloatWindowService — draggable floating overlay (like the analyzed app).
- *
- * Shows:
- *   • Status icon (camera on/off)
- *   • Rotation button (0→90→180→270)
- *   • Mirror toggle
- *   • Stop button
- *
- * Communicate rotation/mirror changes back to VCamService via broadcasts.
+ * FloatWindowService — draggable overlay with Rotate / Mirror / Stop.
+ * Launched by VCamService after injection starts (requires SYSTEM_ALERT_WINDOW).
  */
 class FloatWindowService : Service() {
 
     companion object {
-        const val ACTION_START          = "com.vcam.float.START"
-        const val ACTION_STOP_FLOAT     = "com.vcam.float.STOP"
-        const val ACTION_UPDATE_STATUS  = "com.vcam.float.UPDATE_STATUS"
+        const val ACTION_START       = "com.vcam.float.START"
+        const val ACTION_STOP_FLOAT  = "com.vcam.float.STOP"
+        const val EXTRA_IS_VIDEO     = "float_is_video"
 
-        const val EXTRA_TARGET_NAME     = "float_target_name"
-        const val EXTRA_IS_VIDEO        = "float_is_video"
+        const val ACTION_ROTATE      = "com.vcam.float.ROTATE"
+        const val ACTION_MIRROR      = "com.vcam.float.MIRROR"
+        const val ACTION_STOP_VCAM   = "com.vcam.float.STOP_VCAM"
 
-        /** Broadcast from float window to VCamService */
-        const val ACTION_ROTATE         = "com.vcam.float.ROTATE"
-        const val ACTION_MIRROR         = "com.vcam.float.MIRROR"
-        const val ACTION_STOP_VCAM      = "com.vcam.float.STOP_VCAM"
-
-        private const val CHANNEL_ID    = "vcam_float_channel"
-        private const val NOTIF_ID      = 1002
+        private const val CHANNEL_ID = "vcam_float_ch"
+        private const val NOTIF_ID   = 1002
     }
 
     private var windowManager: WindowManager? = null
     private var floatView: View? = null
-    private var layoutParams: WindowManager.LayoutParams? = null
-    private var currentRotation = 0
+    private var lp: WindowManager.LayoutParams? = null
+    private var rotation = 0
     private var isMirrored = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        createChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                val targetName = intent.getStringExtra(EXTRA_TARGET_NAME) ?: "All Apps"
-                val isVideo    = intent.getBooleanExtra(EXTRA_IS_VIDEO, false)
-                startForeground(NOTIF_ID, buildNotification(targetName, isVideo))
-                showFloatWindow(targetName, isVideo)
+                val isVideo = intent.getBooleanExtra(EXTRA_IS_VIDEO, false)
+                startForeground(NOTIF_ID, buildNotif(isVideo))
+                showWindow(isVideo)
             }
             ACTION_STOP_FLOAT -> {
-                removeFloatWindow()
+                removeWindow()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
@@ -71,112 +59,80 @@ class FloatWindowService : Service() {
         return START_NOT_STICKY
     }
 
-    override fun onDestroy() {
-        removeFloatWindow()
-        super.onDestroy()
-    }
+    override fun onDestroy() { removeWindow(); super.onDestroy() }
 
-    // ── Float window ──────────────────────────────────────────────────
+    // ── Window ────────────────────────────────────────────────────────
 
-    private fun showFloatWindow(targetName: String, isVideo: Boolean) {
+    private fun showWindow(isVideo: Boolean) {
         if (floatView != null) return
+        val v = LayoutInflater.from(this).inflate(R.layout.float_window, null)
 
-        val inflater = LayoutInflater.from(this)
-        val view = inflater.inflate(R.layout.float_window, null)
-
-        // Set target label
-        view.findViewById<TextView>(R.id.tv_float_target)?.text =
-            if (targetName.length > 18) targetName.take(16) + "…" else targetName
-        view.findViewById<TextView>(R.id.tv_float_type)?.text =
+        // Labels
+        v.findViewById<TextView>(R.id.tv_float_type)?.text =
             if (isVideo) "🎬 Video" else "🖼 Image"
 
-        // Rotation button
-        val btnRotate = view.findViewById<ImageButton>(R.id.btn_float_rotate)
-        btnRotate?.setOnClickListener {
-            currentRotation = (currentRotation + 90) % 360
-            val btn = it as? ImageButton
-            btn?.contentDescription = "Rotate ${currentRotation}°"
-            sendBroadcast(Intent(ACTION_ROTATE).putExtra("rotation", currentRotation))
-            Toast.makeText(this, "Rotation: ${currentRotation}°", Toast.LENGTH_SHORT).show()
+        // Rotate
+        v.findViewById<ImageButton>(R.id.btn_float_rotate)?.setOnClickListener {
+            rotation = (rotation + 90) % 360
+            sendBroadcast(Intent(ACTION_ROTATE).putExtra("rotation", rotation))
+            Toast.makeText(this, "${rotation}°", Toast.LENGTH_SHORT).show()
         }
 
-        // Mirror button
-        val btnMirror = view.findViewById<ImageButton>(R.id.btn_float_mirror)
+        // Mirror
+        val btnMirror = v.findViewById<ImageButton>(R.id.btn_float_mirror)
         btnMirror?.setOnClickListener {
             isMirrored = !isMirrored
             btnMirror.alpha = if (isMirrored) 1f else 0.5f
             sendBroadcast(Intent(ACTION_MIRROR).putExtra("mirror", isMirrored))
-            Toast.makeText(this, if (isMirrored) "Mirror: ON" else "Mirror: OFF", Toast.LENGTH_SHORT).show()
         }
 
-        // Stop button
-        view.findViewById<ImageButton>(R.id.btn_float_stop)?.setOnClickListener {
+        // Stop
+        v.findViewById<ImageButton>(R.id.btn_float_stop)?.setOnClickListener {
             sendBroadcast(Intent(ACTION_STOP_VCAM))
             sendBroadcast(Intent(ACTION_STOP_FLOAT))
-            removeFloatWindow()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
         }
 
-        // Drag support
-        val lp = WindowManager.LayoutParams(
+        val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                @Suppress("DEPRECATION")
-                WindowManager.LayoutParams.TYPE_PHONE,
+            else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 50
-            y = 200
-        }
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 50; y = 200 }
 
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        windowManager = wm
-        layoutParams  = lp
-        floatView     = view
+        windowManager = wm; lp = params; floatView = v
 
-        // Drag only on the header row, not on buttons
-        view.findViewById<View>(R.id.tv_float_target)?.setOnTouchListener(
-            DragTouchListener(view, wm, lp)
-        )
-        view.findViewById<View>(R.id.tv_float_type)?.setOnTouchListener(
-            DragTouchListener(view, wm, lp)
-        )
-        wm.addView(view, lp)
+        // Drag only on header labels, not on buttons
+        val dragger = DragTouch(v, wm, params)
+        v.findViewById<TextView>(R.id.tv_float_type)?.setOnTouchListener(dragger)
+
+        wm.addView(v, params)
     }
 
-    private fun removeFloatWindow() {
-        try {
-            floatView?.let { windowManager?.removeView(it) }
-        } catch (_: Exception) {}
+    private fun removeWindow() {
+        try { floatView?.let { windowManager?.removeView(it) } } catch (_: Exception) {}
         floatView = null
     }
 
-    // ── Drag listener ─────────────────────────────────────────────────
+    // ── Drag ─────────────────────────────────────────────────────────
 
-    private inner class DragTouchListener(
-        private val view: View,
+    private inner class DragTouch(
+        private val v: View,
         private val wm: WindowManager,
-        private val lp: WindowManager.LayoutParams
+        private val p: WindowManager.LayoutParams
     ) : View.OnTouchListener {
-        private var initX = 0; private var initY = 0
-        private var touchX = 0f; private var touchY = 0f
+        private var ix = 0; private var iy = 0
+        private var tx = 0f; private var ty = 0f
 
-        override fun onTouch(v: View, event: MotionEvent): Boolean {
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    initX = lp.x; initY = lp.y
-                    touchX = event.rawX; touchY = event.rawY
-                }
+        override fun onTouch(view: View, e: MotionEvent): Boolean {
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> { ix=p.x; iy=p.y; tx=e.rawX; ty=e.rawY }
                 MotionEvent.ACTION_MOVE -> {
-                    lp.x = initX + (event.rawX - touchX).toInt()
-                    lp.y = initY + (event.rawY - touchY).toInt()
-                    wm.updateViewLayout(view, lp)
+                    p.x = ix+(e.rawX-tx).toInt(); p.y = iy+(e.rawY-ty).toInt()
+                    wm.updateViewLayout(v, p)
                 }
             }
             return false
@@ -185,28 +141,22 @@ class FloatWindowService : Service() {
 
     // ── Notification ──────────────────────────────────────────────────
 
-    private fun createNotificationChannel() {
+    private fun createChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "VCam Float Window",
-                NotificationManager.IMPORTANCE_MIN
-            )
-            getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
+            val ch = NotificationChannel(CHANNEL_ID, "VCam Float",
+                NotificationManager.IMPORTANCE_MIN)
+            getSystemService(NotificationManager::class.java)?.createNotificationChannel(ch)
         }
     }
 
-    private fun buildNotification(targetName: String, isVideo: Boolean): Notification {
-        val pi = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+    private fun buildNotif(isVideo: Boolean): Notification {
+        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setContentTitle("VCam Float — Active")
-            .setContentText("Injecting ${if (isVideo) "video" else "image"} → $targetName")
-            .setContentIntent(pi)
-            .setPriority(NotificationCompat.PRIORITY_MIN)
-            .setOngoing(true)
-            .build()
+            .setContentTitle("Virtual Cam — Float Controls")
+            .setContentText("${if (isVideo) "Video" else "Image"} injection active")
+            .setContentIntent(pi).setPriority(NotificationCompat.PRIORITY_MIN)
+            .setOngoing(true).build()
     }
 }

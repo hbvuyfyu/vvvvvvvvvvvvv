@@ -8,21 +8,19 @@ import android.os.IBinder
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import com.vcam.R
+import com.vcam.ui.CodeGateActivity
 import com.vcam.ui.MainActivity
 import com.vcam.utils.CameraInjector
 import com.vcam.utils.MediaUtils
-import com.vcam.utils.RootManager
 import kotlinx.coroutines.*
 
 class VCamService : Service() {
 
     companion object {
-        const val ACTION_START          = "com.vcam.ACTION_START"
-        const val ACTION_STOP           = "com.vcam.ACTION_STOP"
-        const val EXTRA_MEDIA_URI       = "extra_media_uri"
-        const val EXTRA_TARGET_PACKAGE  = "extra_target_package"
-        const val EXTRA_TARGET_NAME     = "extra_target_name"
-        const val EXTRA_IS_VIDEO        = "extra_is_video"
+        const val ACTION_START       = "com.vcam.ACTION_START"
+        const val ACTION_STOP        = "com.vcam.ACTION_STOP"
+        const val EXTRA_MEDIA_URI    = "extra_media_uri"
+        const val EXTRA_IS_VIDEO     = "extra_is_video"
 
         private const val CHANNEL_ID      = "vcam_channel"
         private const val NOTIFICATION_ID = 1001
@@ -31,19 +29,14 @@ class VCamService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
     private var injector: CameraInjector? = null
 
-    /** Receives rotation / mirror commands from FloatWindowService */
     private val controlReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
+        override fun onReceive(ctx: Context, intent: Intent) {
             when (intent.action) {
-                FloatWindowService.ACTION_ROTATE -> {
-                    val r = intent.getIntExtra("rotation", 0)
-                    injector?.rotation = r
-                }
-                FloatWindowService.ACTION_MIRROR -> {
-                    val m = intent.getBooleanExtra("mirror", false)
-                    injector?.mirror = m
-                }
-                FloatWindowService.ACTION_STOP_VCAM -> {
+                FloatWindowService.ACTION_ROTATE     ->
+                    injector?.rotation = intent.getIntExtra("rotation", 0)
+                FloatWindowService.ACTION_MIRROR     ->
+                    injector?.mirror = intent.getBooleanExtra("mirror", false)
+                FloatWindowService.ACTION_STOP_VCAM  -> {
                     stopInjection()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
@@ -65,6 +58,7 @@ class VCamService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(controlReceiver, filter, RECEIVER_NOT_EXPORTED)
         } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(controlReceiver, filter)
         }
     }
@@ -78,19 +72,12 @@ class VCamService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                val mediaUriStr   = intent.getStringExtra(EXTRA_MEDIA_URI)    ?: return START_NOT_STICKY
-                val mediaUri      = Uri.parse(mediaUriStr)
-                val targetPackage = intent.getStringExtra(EXTRA_TARGET_PACKAGE)
-                val targetName    = intent.getStringExtra(EXTRA_TARGET_NAME)  ?: targetPackage ?: "All Apps"
-                val isVideo       = intent.getBooleanExtra(EXTRA_IS_VIDEO, false)
-
-                startForeground(NOTIFICATION_ID, buildNotification(targetName, isVideo, "Setting up…"))
-                serviceScope.launch { startInjection(mediaUri, targetPackage, targetName, isVideo) }
-
-                // Launch floating window if overlay permission granted
-                if (Settings.canDrawOverlays(this)) {
-                    startFloatWindow(targetName, isVideo)
-                }
+                val uriStr  = intent.getStringExtra(EXTRA_MEDIA_URI) ?: return START_NOT_STICKY
+                val isVideo = intent.getBooleanExtra(EXTRA_IS_VIDEO, false)
+                val mediaUri = Uri.parse(uriStr)
+                startForeground(NOTIFICATION_ID, buildNotification("Starting…", isVideo))
+                serviceScope.launch { startInjection(mediaUri, isVideo) }
+                if (Settings.canDrawOverlays(this)) startFloatWindow(isVideo)
             }
             ACTION_STOP -> {
                 stopInjection()
@@ -104,36 +91,22 @@ class VCamService : Service() {
 
     // ── Injection ─────────────────────────────────────────────────────
 
-    private suspend fun startInjection(
-        mediaUri: Uri, targetPackage: String?,
-        targetName: String, isVideo: Boolean
-    ) {
+    private suspend fun startInjection(mediaUri: Uri, isVideo: Boolean) {
         try {
-            val mediaFile = MediaUtils.copyUriToFile(
+            val file = MediaUtils.copyUriToFile(
                 this, mediaUri,
                 if (isVideo) "vcam_input.mp4" else "vcam_input.jpg"
-            ) ?: run {
-                updateNotification("VCam Error", "Cannot copy media file")
-                return
-            }
+            ) ?: run { updateNotification("Error: cannot read media", isVideo); return }
 
             injector = CameraInjector(
-                context = this,
-                mediaPath = mediaFile.absolutePath,
-                isVideo = isVideo,
-                targetPackage = targetPackage
+                context   = this,
+                mediaPath = file.absolutePath,
+                isVideo   = isVideo
             )
             injector?.start()
-
-            updateNotification(
-                "VCam Active ✓",
-                if (!targetPackage.isNullOrBlank())
-                    "Injecting into $targetName — open the app now"
-                else
-                    "System-wide injection active — open any camera app"
-            )
+            updateNotification("Injection active — open any camera app", isVideo)
         } catch (e: Exception) {
-            updateNotification("VCam Error", e.message ?: "Unknown error")
+            updateNotification("Error: ${e.message}", isVideo)
         }
     }
 
@@ -144,10 +117,9 @@ class VCamService : Service() {
 
     // ── Float window ──────────────────────────────────────────────────
 
-    private fun startFloatWindow(targetName: String, isVideo: Boolean) {
+    private fun startFloatWindow(isVideo: Boolean) {
         val i = Intent(this, FloatWindowService::class.java).apply {
             action = FloatWindowService.ACTION_START
-            putExtra(FloatWindowService.EXTRA_TARGET_NAME, targetName)
             putExtra(FloatWindowService.EXTRA_IS_VIDEO, isVideo)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i)
@@ -160,57 +132,40 @@ class VCamService : Service() {
         })
     }
 
-    // ── Notification ──────────────────────────────────────────────────
+    // ── Notifications ─────────────────────────────────────────────────
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "VCam Injection",
+            val ch = NotificationChannel(
+                CHANNEL_ID, "Virtual Cam",
                 NotificationManager.IMPORTANCE_LOW
-            ).apply { description = "VCam camera injection service" }
-            getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
+            ).apply { description = "Camera injection service" }
+            getSystemService(NotificationManager::class.java)?.createNotificationChannel(ch)
         }
     }
 
-    private fun buildNotification(targetName: String, isVideo: Boolean, status: String): Notification {
-        val pi = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+    private fun buildNotification(status: String, isVideo: Boolean): Notification {
         val stopPi = PendingIntent.getService(
             this, 1,
             Intent(this, VCamService::class.java).apply { action = ACTION_STOP },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val openPi = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_vcam_notif)
-            .setContentTitle("VCam — ${if (isVideo) "Video" else "Image"} → $targetName")
+            .setContentTitle("Virtual Cam — ${if (isVideo) "Video" else "Image"}")
             .setContentText(status)
-            .setContentIntent(pi)
-            .addAction(android.R.drawable.ic_media_pause, "Stop VCam", stopPi)
+            .setContentIntent(openPi)
+            .addAction(android.R.drawable.ic_media_pause, "Stop", stopPi)
             .setOngoing(true)
             .build()
     }
 
-    private fun updateNotification(title: String, text: String) {
-        val nm = getSystemService(NotificationManager::class.java) ?: return
-        val pi = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val stopPi = PendingIntent.getService(
-            this, 1,
-            Intent(this, VCamService::class.java).apply { action = ACTION_STOP },
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val n = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_vcam_notif)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setContentIntent(pi)
-            .addAction(android.R.drawable.ic_media_pause, "Stop VCam", stopPi)
-            .setOngoing(true)
-            .build()
-        nm.notify(NOTIFICATION_ID, n)
+    private fun updateNotification(status: String, isVideo: Boolean) {
+        getSystemService(NotificationManager::class.java)
+            ?.notify(NOTIFICATION_ID, buildNotification(status, isVideo))
     }
 }

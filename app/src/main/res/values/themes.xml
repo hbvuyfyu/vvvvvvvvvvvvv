@@ -1,10 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.VCam" parent="Theme.MaterialComponents.Light.NoActionBar">
+    <style name="Theme.VCam" parent="Theme.MaterialComponents.DayNight.NoActionBar">
         <item name="colorPrimary">@color/color_primary</item>
         <item name="colorPrimaryDark">@color/color_primary_dark</item>
         <item name="colorAccent">@color/color_accent</item>
-        <item name="android:windowBackground">@color/color_background</item>
-        <item name="android:statusBarColor">@color/color_primary_dark</item>
+        <item name="android:windowBackground">@color/color_bg</item>
+        <item name="android:statusBarColor">@color/black</item>
+        <item name="android:navigationBarColor">@color/black</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <!-- Splash / Code-gate (full black) -->
+    <style name="Theme.VCam.CodeGate" parent="Theme.VCam">
+        <item name="android:windowBackground">@color/black</item>
     </style>
 </resources>

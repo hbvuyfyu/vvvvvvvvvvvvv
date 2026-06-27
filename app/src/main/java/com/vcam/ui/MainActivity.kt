@@ -1,6 +1,7 @@
 package com.vcam.ui
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -13,151 +14,119 @@ import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
-import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.android.material.snackbar.Snackbar
 import com.vcam.R
 import com.vcam.databinding.ActivityMainBinding
-import com.vcam.model.AppInfo
 import com.vcam.service.VCamService
-import com.vcam.ui.adapter.AppListAdapter
 import com.vcam.viewmodel.MainViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private val viewModel: MainViewModel by viewModels()
-    private lateinit var appListAdapter: AppListAdapter
 
-    /** Pick any image OR video */
     private val pickMedia = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri?.let { viewModel.setMediaUri(it, this) }
     }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        val allGranted = permissions.values.all { it }
-        lifecycleScope.launch {
-            viewModel.initRoot()
-            if (allGranted) viewModel.loadInstalledApps(this@MainActivity)
-            else showSnack(getString(R.string.permissions_required))
-        }
-    }
+    ) { _ -> viewModel.initRoot() }
 
-    /** Result for SYSTEM_ALERT_WINDOW (overlay) permission */
     private val overlayPermLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
-    ) { /* User returns — we just continue */ }
+    ) { /* user returns */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        setupToolbar()
-        setupRecyclerView()
         setupObservers()
-        setupClickListeners()
+        setupClicks()
         requestPermissions()
     }
 
-    private fun setupToolbar() { setSupportActionBar(binding.toolbar) }
+    override fun onResume() {
+        super.onResume()
+        // Re-check code every time app comes to foreground
+        lifecycleScope.launch { checkCodeStillValid() }
+    }
 
-    private fun setupRecyclerView() {
-        appListAdapter = AppListAdapter { app -> viewModel.selectTargetApp(app) }
-        binding.rvApps.apply {
-            layoutManager = LinearLayoutManager(this@MainActivity)
-            adapter = appListAdapter
+    // ── Code re-verification ──────────────────────────────────────────
+
+    private suspend fun checkCodeStillValid() {
+        val prefs = getSharedPreferences("vcam_gate", Context.MODE_PRIVATE)
+        val stored = prefs.getString("access_code", null) ?: run {
+            logout(); return
+        }
+        val content = CodeGateActivity.fetchAllCod() ?: return // offline → allow
+        if (!CodeGateActivity.codeExistsIn(content, stored)) {
+            withContext(Dispatchers.Main) { logout() }
         }
     }
 
+    private fun logout() {
+        getSharedPreferences("vcam_gate", Context.MODE_PRIVATE).edit()
+            .remove("access_code").apply()
+        stopVCamService()
+        startActivity(Intent(this, CodeGateActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
+        finish()
+    }
+
+    // ── Observers ─────────────────────────────────────────────────────
+
     private fun setupObservers() {
-        viewModel.filteredApps.observe(this) { apps ->
-            appListAdapter.submitList(apps)
-            binding.progressApps.visibility = View.GONE
-            binding.tvNoApps.visibility = if (apps.isEmpty()) View.VISIBLE else View.GONE
-        }
-
-        viewModel.selectedApp.observe(this) { app ->
-            if (app != null) {
-                binding.tvSelectedApp.text = app.appName
-                binding.cardSelectedApp.visibility = View.VISIBLE
-            } else {
-                binding.cardSelectedApp.visibility = View.GONE
-            }
-        }
-
         viewModel.mediaUri.observe(this) { uri ->
             if (uri != null) {
-                binding.tvMediaSelected.text = getString(R.string.media_selected)
                 binding.ivMediaPreview.setImageURI(uri)
-                binding.cardMedia.visibility = View.VISIBLE
-                binding.layoutMediaType.visibility = View.VISIBLE
-                updateStartButton()
+                binding.ivMediaPreview.visibility   = View.VISIBLE
+                binding.layoutPlaceholder.visibility = View.GONE
+                binding.btnClearMedia.visibility     = View.VISIBLE
+                binding.tvMediaBadge.visibility      = View.VISIBLE
+                binding.tvMediaBadge.text =
+                    if (viewModel.isVideo.value == true) "VIDEO" else "IMAGE"
+                setStartEnabled(true)
             } else {
-                binding.cardMedia.visibility = View.GONE
-                binding.layoutMediaType.visibility = View.GONE
+                binding.ivMediaPreview.visibility    = View.GONE
+                binding.layoutPlaceholder.visibility = View.VISIBLE
+                binding.btnClearMedia.visibility     = View.GONE
+                binding.tvMediaBadge.visibility      = View.GONE
+                setStartEnabled(false)
             }
         }
 
         viewModel.isServiceRunning.observe(this) { running ->
-            binding.btnStartStop.text = if (running) getString(R.string.stop_vcam)
-                                         else getString(R.string.start_vcam)
-            val color = if (running) R.color.color_stop else R.color.color_start
-            binding.btnStartStop.backgroundTintList =
-                androidx.core.content.res.ResourcesCompat.getColorStateList(resources, color, theme)
+            if (running) {
+                binding.btnStartStop.text       = getString(R.string.stop_vcam)
+                binding.btnStartStop.setTextColor(0xFFFF3B3B.toInt())
+                binding.tvHint.visibility       = View.VISIBLE
+                binding.tvHint.text             = getString(R.string.injection_active)
+            } else {
+                binding.btnStartStop.text       = getString(R.string.start_vcam)
+                binding.btnStartStop.setTextColor(0xFF000000.toInt())
+                binding.tvHint.visibility       = View.GONE
+            }
         }
 
         viewModel.rootStatus.observe(this) { ok ->
-            binding.tvRootStatus.text = if (ok) getString(R.string.root_granted)
-                                         else getString(R.string.root_denied)
+            binding.tvRootStatus.text = if (ok) "Rooted ✓" else "No Root ✗"
             binding.tvRootStatus.setTextColor(
                 ContextCompat.getColor(this, if (ok) R.color.color_root_ok else R.color.color_root_fail)
             )
         }
-
-        viewModel.errorMessage.observe(this) { msg ->
-            if (!msg.isNullOrBlank()) { showSnack(msg); viewModel.clearError() }
-        }
-
-        viewModel.isLoading.observe(this) { loading ->
-            binding.progressApps.visibility = if (loading) View.VISIBLE else View.GONE
-        }
     }
 
-    private fun setupClickListeners() {
-        // Pick image
-        binding.btnPickImage?.setOnClickListener {
-            pickMedia.launch("image/*")
-        }
+    // ── Click listeners ───────────────────────────────────────────────
 
-        // Pick video
-        binding.btnPickVideo?.setOnClickListener {
-            pickMedia.launch("video/*")
-        }
+    private fun setupClicks() {
+        binding.btnPickImage.setOnClickListener  { pickMedia.launch("image/*") }
+        binding.btnPickVideo.setOnClickListener  { pickMedia.launch("video/*") }
+        binding.btnClearMedia.setOnClickListener { viewModel.clearMedia() }
 
-        // Clear media
-        binding.btnClearMedia?.setOnClickListener { viewModel.clearMedia() }
-
-        // Clear selected app
-        binding.btnClearApp?.setOnClickListener { viewModel.clearSelectedApp() }
-
-        // Search
-        binding.etSearch?.addTextChangedListener(object : android.text.TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
-            override fun onTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {
-                viewModel.filterApps(s?.toString() ?: "")
-            }
-            override fun afterTextChanged(e: android.text.Editable?) {}
-        })
-
-        // Chip filter
-        binding.chipGroupFilter?.setOnCheckedStateChangeListener { _, ids ->
-            viewModel.setAppFilter(ids.firstOrNull())
-        }
-
-        // Start/Stop button
         binding.btnStartStop.setOnClickListener {
             if (viewModel.isServiceRunning.value == true) {
                 stopVCamService()
@@ -167,77 +136,59 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun handleStart() {
-        val mediaUri = viewModel.mediaUri.value ?: run {
-            showSnack(getString(R.string.select_media_first)); return
-        }
-        val targetApp = viewModel.selectedApp.value
-
-        if (targetApp == null) {
-            MaterialAlertDialogBuilder(this)
-                .setTitle(R.string.no_target_app)
-                .setMessage(R.string.no_target_app_message)
-                .setPositiveButton(R.string.start_anyway) { _, _ ->
-                    checkOverlayThenStart(mediaUri, null)
-                }
-                .setNegativeButton(android.R.string.cancel, null)
-                .show()
-        } else {
-            checkOverlayThenStart(mediaUri, targetApp)
-        }
+    private fun setStartEnabled(enabled: Boolean) {
+        binding.btnStartStop.alpha   = if (enabled) 1f else 0.4f
+        binding.btnStartStop.isEnabled = enabled
     }
 
-    /** Ask for overlay permission, then start the service. */
-    private fun checkOverlayThenStart(mediaUri: Uri, targetApp: AppInfo?) {
+    // ── Start/stop ────────────────────────────────────────────────────
+
+    private fun handleStart() {
+        val mediaUri = viewModel.mediaUri.value ?: return
+        checkOverlayThenStart(mediaUri)
+    }
+
+    private fun checkOverlayThenStart(mediaUri: Uri) {
         if (!Settings.canDrawOverlays(this)) {
-            MaterialAlertDialogBuilder(this)
+            MaterialAlertDialogBuilder(this, R.style.Theme_VCam)
                 .setTitle(R.string.overlay_permission_title)
                 .setMessage(R.string.overlay_permission_msg)
                 .setPositiveButton(R.string.grant) { _, _ ->
-                    val intent = Intent(
-                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:$packageName")
+                    overlayPermLauncher.launch(
+                        Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                               Uri.parse("package:$packageName"))
                     )
-                    overlayPermLauncher.launch(intent)
-                    // Start anyway even if permission not yet granted
-                    doStartService(mediaUri, targetApp)
+                    doStartService(mediaUri)
                 }
-                .setNegativeButton(R.string.skip) { _, _ ->
-                    doStartService(mediaUri, targetApp)
-                }
+                .setNegativeButton(R.string.skip) { _, _ -> doStartService(mediaUri) }
                 .show()
         } else {
-            doStartService(mediaUri, targetApp)
+            doStartService(mediaUri)
         }
     }
 
-    private fun doStartService(mediaUri: Uri, targetApp: AppInfo?) {
+    private fun doStartService(mediaUri: Uri) {
         val intent = Intent(this, VCamService::class.java).apply {
             action = VCamService.ACTION_START
             putExtra(VCamService.EXTRA_MEDIA_URI, mediaUri.toString())
-            targetApp?.let {
-                putExtra(VCamService.EXTRA_TARGET_PACKAGE, it.packageName)
-                putExtra(VCamService.EXTRA_TARGET_NAME, it.appName)
-            }
             putExtra(VCamService.EXTRA_IS_VIDEO, viewModel.isVideo.value == true)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
         else startService(intent)
         viewModel.setServiceRunning(true)
-        showSnack(getString(R.string.injection_active))
     }
 
     private fun stopVCamService() {
-        startService(Intent(this, VCamService::class.java).apply { action = VCamService.ACTION_STOP })
+        startService(Intent(this, VCamService::class.java).apply {
+            action = VCamService.ACTION_STOP
+        })
         viewModel.setServiceRunning(false)
     }
 
-    private fun updateStartButton() {
-        binding.btnStartStop.isEnabled = viewModel.mediaUri.value != null
-    }
+    // ── Permissions ───────────────────────────────────────────────────
 
     private fun requestPermissions() {
-        val permissions = buildList {
+        val perms = buildList {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add(Manifest.permission.READ_MEDIA_IMAGES)
                 add(Manifest.permission.READ_MEDIA_VIDEO)
@@ -245,21 +196,11 @@ class MainActivity : AppCompatActivity() {
             } else {
                 add(Manifest.permission.READ_EXTERNAL_STORAGE)
             }
-            add(Manifest.permission.CAMERA)
         }
-        val toRequest = permissions.filter {
+        val needed = perms.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-        if (toRequest.isNotEmpty()) {
-            permissionLauncher.launch(toRequest.toTypedArray())
-        } else {
-            lifecycleScope.launch {
-                viewModel.initRoot()
-                viewModel.loadInstalledApps(this@MainActivity)
-            }
-        }
+        if (needed.isNotEmpty()) permissionLauncher.launch(needed.toTypedArray())
+        else viewModel.initRoot()
     }
-
-    private fun showSnack(msg: String) =
-        Snackbar.make(binding.root, msg, Snackbar.LENGTH_LONG).show()
 }
