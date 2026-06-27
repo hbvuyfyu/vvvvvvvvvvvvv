@@ -23,7 +23,7 @@ target_compile_options(vcam_native PRIVATE -O2 -Wall -std=c++17)
 # Intercepts hw_get_module → serves YUYV frames from shared file.
 add_library(vcam_inject SHARED vcam_inject.cpp)
 target_link_libraries(vcam_inject ${log-lib} dl)
-target_compile_options(vcam_inject PRIVATE -O2 -Wall -std=c11)
+target_compile_options(vcam_inject PRIVATE -O2 -Wall -std=c++17)
 
 # Export both libs so they're packaged in the APK's jniLibs
 set_target_properties(vcam_native PROPERTIES
