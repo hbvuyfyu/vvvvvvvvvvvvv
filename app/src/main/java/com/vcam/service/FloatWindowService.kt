@@ -140,7 +140,13 @@ class FloatWindowService : Service() {
         layoutParams  = lp
         floatView     = view
 
-        view.setOnTouchListener(DragTouchListener(view, wm, lp))
+        // Drag only on the header row, not on buttons
+        view.findViewById<View>(R.id.tv_float_target)?.setOnTouchListener(
+            DragTouchListener(view, wm, lp)
+        )
+        view.findViewById<View>(R.id.tv_float_type)?.setOnTouchListener(
+            DragTouchListener(view, wm, lp)
+        )
         wm.addView(view, lp)
     }
 

@@ -56,11 +56,10 @@
             android:exported="false"
             android:foregroundServiceType="camera" />
 
-        <!-- Floating overlay window service -->
+        <!-- Floating overlay window service — no foregroundServiceType needed on < API 34 -->
         <service
             android:name=".service.FloatWindowService"
-            android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:exported="false" />
 
     </application>
 

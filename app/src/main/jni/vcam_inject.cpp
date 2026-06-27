@@ -207,6 +207,21 @@ static void* preview_thread_fn(void* arg) {
     return NULL;
 }
 
+/* ── Fake device close ───────────────────────────────────────────────── */
+static int fake_device_close(struct hw_device_t* device) {
+    if (!device) return 0;
+    camera_device_t* cam = (camera_device_t*)device;
+    fake_stop_preview(cam);
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)cam->priv;
+    if (priv) {
+        free(priv);
+        cam->priv = NULL;
+    }
+    free(cam);
+    LOGI("VCam: device closed");
+    return 0;
+}
+
 /* ── Fake camera device ops ─────────────────────────────────────────── */
 static int fake_set_preview_window(struct camera_device* dev,
                                     struct preview_stream_ops* window) {
@@ -243,7 +258,12 @@ static int fake_start_preview(struct camera_device* dev) {
     fake_cam_priv_t* priv = (fake_cam_priv_t*)dev->priv;
     if (!priv || priv->preview_running) return 0;
     priv->preview_running = 1;
-    pthread_create(&priv->preview_thread, NULL, preview_thread_fn, priv);
+    int rc = pthread_create(&priv->preview_thread, NULL, preview_thread_fn, priv);
+    if (rc != 0) {
+        LOGE("VCam: pthread_create failed: %d", rc);
+        priv->preview_running = 0;
+        return -1;
+    }
     LOGI("VCam: preview started");
     return 0;
 }
@@ -380,7 +400,7 @@ static int fake_camera_open(const struct hw_module_t* module,
     cam->common.tag     = 0x48574456; /* HWDV */
     cam->common.version = 1;
     cam->common.module  = (struct hw_module_t*)module;
-    cam->common.close   = NULL;
+    cam->common.close   = fake_device_close;
     cam->ops            = &g_fake_ops;
     cam->priv           = priv;
 
