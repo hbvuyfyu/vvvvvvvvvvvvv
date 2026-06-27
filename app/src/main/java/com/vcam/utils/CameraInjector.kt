@@ -1,213 +1,373 @@
 package com.vcam.utils
 
-  import android.content.Context
-  import android.util.Log
-  import kotlinx.coroutines.CoroutineScope
-  import kotlinx.coroutines.Dispatchers
-  import kotlinx.coroutines.Job
-  import kotlinx.coroutines.delay
-  import kotlinx.coroutines.launch
-  import java.io.File
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.media.MediaMetadataRetriever
+import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 
-  /**
-   * CameraInjector
-   *
-   * PRIMARY (rooted Android 8+):
-   *   1. Copy libvcam_inject.so  -> /data/local/tmp/libvcam_inject.so
-   *   2. Copy source image       -> /data/local/tmp/vcam/source.jpg
-   *   3. setprop wrap.<pkg>         LD_PRELOAD=...
-   *   4. am force-stop <pkg>
-   *   5. auto-relaunch the app (camera calls now intercepted by hook)
-   *
-   * The hook ONLY intercepts camera HAL; all other hardware calls
-   * (sensors, display, etc.) pass through to the real implementation.
-   */
-  class CameraInjector(
-      private val context: Context,
-      private val mediaPath: String,
-      private val isVideo: Boolean,
-      private val targetPackage: String?
-  ) {
-      companion object {
-          private const val TAG        = "CameraInjector"
-          private const val VCAM_DIR   = "/data/local/tmp/vcam"
-          private const val INJECT_LIB = "/data/local/tmp/libvcam_inject.so"
+/**
+ * CameraInjector — system-wide camera replacement for Magisk-rooted Android.
+ *
+ * Strategy (tried in order):
+ *   1. v4l2loopback — loads kernel module, writes real frames to /dev/videoX.
+ *      Works system-wide for ALL apps transparently.
+ *   2. LD_PRELOAD via wrap.cameraserver + wrap.<pkg> — hooks camera HAL inside
+ *      the camera server process and/or the target app process.
+ *      Reads frames from /data/local/tmp/vcam/frame.yuyv (written by us).
+ *
+ * Frame pipeline (Kotlin side):
+ *   Image → BitmapFactory → scale to TARGET_W×TARGET_H
+ *        → bitmapToYUYV() → nativeUpdateYUYVFrame() + v4l2 write
+ *   Video → MediaMetadataRetriever (frame-by-frame) → same pipeline at 30 fps
+ */
+class CameraInjector(
+    private val context: Context,
+    private val mediaPath: String,
+    private val isVideo: Boolean,
+    private val targetPackage: String?,
+    var rotation: Int = 0,   // 0 / 90 / 180 / 270
+    var mirror: Boolean = false
+) {
+    companion object {
+        private const val TAG        = "CameraInjector"
+        private const val VCAM_DIR   = "/data/local/tmp/vcam"
+        private const val INJECT_LIB = "/data/local/tmp/libvcam_inject.so"
+        private const val FRAME_FILE = "$VCAM_DIR/frame.yuyv"
+        private const val META_FILE  = "$VCAM_DIR/frame_info"
 
-          init {
-              try { System.loadLibrary("vcam_native") }
-              catch (e: UnsatisfiedLinkError) { Log.w(TAG, "vcam_native: ${e.message}") }
-          }
+        const val TARGET_W = 1280
+        const val TARGET_H = 720
 
-          @JvmStatic external fun nativeInjectImage(imagePath: String, videoDevice: String): Int
-          @JvmStatic external fun nativeInjectVideo(videoPath: String, videoDevice: String): Int
-          @JvmStatic external fun nativeStopInjection()
-          @JvmStatic external fun nativeCheckDevice(videoDevice: String): Boolean
-      }
+        init {
+            try { System.loadLibrary("vcam_native") }
+            catch (e: UnsatisfiedLinkError) { Log.w(TAG, "vcam_native: ${e.message}") }
+        }
 
-      private val scope = CoroutineScope(Dispatchers.IO + Job())
-      @Volatile private var running = false
-      private var injectionJob: Job? = null
+        /** Start the v4l2 frame-pump loop on the given device. */
+        @JvmStatic external fun nativeStartFrameLoop(width: Int, height: Int, videoDevice: String): Boolean
+        /** Push a new YUYV frame (also writes shared file). */
+        @JvmStatic external fun nativeUpdateYUYVFrame(yuyvData: ByteArray, width: Int, height: Int)
+        /** Stop all injection. */
+        @JvmStatic external fun nativeStopInjection()
+        /** Check whether a v4l2 device supports video-output. */
+        @JvmStatic external fun nativeCheckDevice(videoDevice: String): Boolean
 
-      fun start() {
-          running = true
-          injectionJob = scope.launch { performInjection() }
-      }
+        // Legacy stubs — kept so existing callers compile
+        @JvmStatic external fun nativeInjectImage(imagePath: String, videoDevice: String): Int
+        @JvmStatic external fun nativeInjectVideo(videoPath: String, videoDevice: String): Int
+    }
 
-      fun stop() {
-          running = false
-          injectionJob?.cancel()
-          targetPackage?.let { cleanupWrapProp(it) }
-          try { nativeStopInjection() } catch (_: Exception) {}
-          RootManager.runCommands(
-              "pkill -f ffmpeg 2>/dev/null || true",
-              "pkill -f v4l2  2>/dev/null || true"
-          )
-          Log.d(TAG, "VCam stopped")
-      }
+    private val scope = CoroutineScope(Dispatchers.IO + Job())
+    @Volatile private var running = false
+    private var injectionJob: Job? = null
 
-      // ── PRIMARY: LD_PRELOAD via Android wrap property ─────────────────────
+    // ── Public API ────────────────────────────────────────────────────
 
-      private fun injectViaLdPreload(pkg: String): Boolean {
-          Log.d(TAG, "LD_PRELOAD injection for: $pkg")
+    fun start() {
+        running = true
+        injectionJob = scope.launch { performInjection() }
+    }
 
-          val nativeLibDir = context.applicationInfo.nativeLibraryDir
-          val srcLib = File(nativeLibDir, "libvcam_inject.so")
-          if (!srcLib.exists()) {
-              Log.e(TAG, "libvcam_inject.so not found in $nativeLibDir"); return false
-          }
+    fun stop() {
+        running = false
+        injectionJob?.cancel()
 
-          // Push library and image
-          RootManager.runCommands(
-              "mkdir -p $VCAM_DIR",
-              "cp '${srcLib.absolutePath}' $INJECT_LIB",
-              "chmod 755 $INJECT_LIB"
-          )
-          RootManager.runCommands(
-              "cp '$mediaPath' '$VCAM_DIR/source.jpg' 2>/dev/null || true",
-              "chmod 644 '$VCAM_DIR/source.jpg'"
-          )
-          RootManager.runCommand("printf '%s' '$mediaPath' > $VCAM_DIR/vcam_config")
+        // Clean up LD_PRELOAD properties
+        cleanupAllWrapProps()
 
-          // Relax SELinux
-          RootManager.runCommand("setenforce 0 2>/dev/null || true")
+        try { nativeStopInjection() } catch (_: Exception) {}
 
-          // Set wrap property (Zygote reads it on next app start)
-          val wrapProp = "wrap.$pkg"
-          val propVal  = "LD_PRELOAD=$INJECT_LIB"
-          RootManager.runCommand("setprop '$wrapProp' '$propVal'")
-          RootManager.runCommand("resetprop '$wrapProp' '$propVal' 2>/dev/null || true")
+        // Kill helper processes
+        RootManager.runCommands(
+            "pkill -f ffmpeg 2>/dev/null || true",
+            "pkill -f v4l2  2>/dev/null || true"
+        )
+        // Restart cameraserver so normal camera works again
+        RootManager.runCommand("setprop ctl.restart cameraserver")
+        Log.d(TAG, "VCam stopped")
+    }
 
-          val v = RootManager.runCommand("getprop '$wrapProp'")
-          Log.d(TAG, "wrap prop verified: '${v.output}'")
+    // ── Core injection pipeline ───────────────────────────────────────
 
-          // Force-stop then relaunch
-          RootManager.runCommand("am force-stop $pkg")
-          Thread.sleep(1500)
-          launchApp(pkg)
+    private suspend fun performInjection() {
+        Log.d(TAG, "performInjection: isVideo=$isVideo target=$targetPackage")
 
-          return true
-      }
+        // 1. Push the inject library and set up the shared directory
+        setupInjectLib()
 
-      /**
-       * Relaunch the target app using multiple strategies.
-       * Each strategy is a separate shell command — no complex inline scripts.
-       */
-      private fun launchApp(pkg: String) {
-          // Strategy A: resolve launcher activity via pm, then am start
-          val resolved = RootManager.runCommand(
-              "pm resolve-activity --brief -a android.intent.action.MAIN" +
-              " -c android.intent.category.LAUNCHER $pkg 2>/dev/null | grep '/' | head -1"
-          )
-          val comp = resolved.output.trim()
-          if (comp.contains("/")) {
-              val r = RootManager.runCommand("am start -n $comp 2>/dev/null")
-              if (r.success) {
-                  Log.d(TAG, "Launched via am start -n $comp"); return
-              }
-          }
+        // 2. Load v4l2loopback module
+        tryLoadV4L2Module()
+        val devices = RootManager.getVideoDevices()
 
-          // Strategy B: monkey (fires a LAUNCHER intent for the package)
-          val r2 = RootManager.runCommand(
-              "monkey -p $pkg -c android.intent.category.LAUNCHER 1 2>/dev/null"
-          )
-          if (r2.success) {
-              Log.d(TAG, "Launched via monkey"); return
-          }
+        // 3. Start the LD_PRELOAD injection (sets up props + restarts procs)
+        setupLdPreload()
 
-          // Strategy C: cmd package resolve-activity (newer Android versions)
-          val resolved2 = RootManager.runCommand(
-              "cmd package resolve-activity --brief -a android.intent.action.MAIN" +
-              " -c android.intent.category.LAUNCHER $pkg 2>/dev/null | tail -1"
-          )
-          val comp2 = resolved2.output.trim()
-          if (comp2.contains("/")) {
-              RootManager.runCommand("am start -n $comp2 2>/dev/null")
-              Log.d(TAG, "Launched via cmd package / am start -n $comp2"); return
-          }
+        // 4. Stream real frames
+        if (devices.isNotEmpty()) {
+            val device = devices.last()
+            Log.d(TAG, "v4l2 device: $device")
+            val started = tryStartV4L2(device)
+            if (started) {
+                streamFramesToV4L2(device)
+                return
+            }
+        }
 
-          Log.w(TAG, "All launch strategies failed for $pkg")
-      }
+        // Fallback: just write to shared file (LD_PRELOAD inject lib reads it)
+        streamFramesToSharedFile()
+    }
 
-      private fun cleanupWrapProp(pkg: String) {
-          RootManager.runCommand("setprop 'wrap.$pkg' ''   2>/dev/null || true")
-          RootManager.runCommand("resetprop 'wrap.$pkg' '' 2>/dev/null || true")
-          RootManager.runCommand("setenforce 1             2>/dev/null || true")
-      }
+    // ── Library + directory setup ─────────────────────────────────────
 
-      // ── Main flow ─────────────────────────────────────────────────────────
+    private fun setupInjectLib() {
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val srcLib = File(nativeDir, "libvcam_inject.so")
 
-      private suspend fun performInjection() {
-          if (!RootManager.isRooted()) { Log.e(TAG, "Root not available"); return }
+        RootManager.runCommands(
+            "mkdir -p $VCAM_DIR",
+            "chmod 777 $VCAM_DIR"
+        )
 
-          if (!targetPackage.isNullOrBlank()) {
-              injectViaLdPreload(targetPackage)
-              while (running) { delay(2000) }
-              return
-          }
+        if (srcLib.exists()) {
+            RootManager.runCommands(
+                "cp '${srcLib.absolutePath}' $INJECT_LIB",
+                "chmod 755 $INJECT_LIB",
+                "chown root:root $INJECT_LIB 2>/dev/null || true"
+            )
+            Log.d(TAG, "Inject lib pushed: $INJECT_LIB")
+        } else {
+            Log.e(TAG, "libvcam_inject.so not found in $nativeDir")
+        }
+    }
 
-          // No target package: v4l2 fallback
-          tryLoadV4L2Module()
-          val devices = RootManager.getVideoDevices()
-          if (devices.isEmpty()) { Log.e(TAG, "No v4l2 devices"); return }
+    // ── LD_PRELOAD injection (system-wide via cameraserver wrap) ──────
 
-          val device = devices.last()
-          val ffmpeg = findBinary("ffmpeg")
-          if (ffmpeg != null) strategyFfmpegV4L2(ffmpeg, device)
-          else               strategyNativeV4L2(device)
-      }
+    private fun setupLdPreload() {
+        val propVal = "LD_PRELOAD=$INJECT_LIB"
 
-      private fun tryLoadV4L2Module() {
-          RootManager.runCommands(
-              "modprobe v4l2loopback devices=1 video_nr=10 card_label=VCam exclusive_caps=1 2>/dev/null || true",
-              "insmod /vendor/lib/modules/v4l2loopback.ko   devices=1 2>/dev/null || true",
-              "insmod /system/lib/modules/v4l2loopback.ko   devices=1 2>/dev/null || true",
-              "insmod /system/lib64/modules/v4l2loopback.ko devices=1 2>/dev/null || true"
-          )
-      }
+        // Disable SELinux temporarily (Magisk permissive mode may already do this)
+        RootManager.runCommand("setenforce 0 2>/dev/null || true")
 
-      private suspend fun strategyFfmpegV4L2(ffmpeg: String, device: String) {
-          val cmd = if (isVideo)
-              "$ffmpeg -stream_loop -1 -re -i '$mediaPath' -f v4l2 $device"
-          else
-              "$ffmpeg -re -loop 1 -i '$mediaPath' -vf scale=640:480 -f v4l2 $device"
-          val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-          while (running) { delay(500) }
-          proc.destroy()
-      }
+        // System-wide: inject into cameraserver and camera provider HAL
+        val systemTargets = listOf(
+            "wrap.cameraserver",
+            "wrap.android.hardware.camera.provider@2.4-service",
+            "wrap.android.hardware.camera.provider@2.5-service",
+            "wrap.android.hardware.camera.provider@2.6-service",
+            "vendor.camera.hal.vendor"
+        )
+        for (prop in systemTargets) {
+            RootManager.runCommand("setprop '$prop' '$propVal'")
+            RootManager.runCommand("resetprop '$prop' '$propVal' 2>/dev/null || true")
+        }
 
-      private suspend fun strategyNativeV4L2(device: String) {
-          scope.launch(Dispatchers.IO) {
-              if (isVideo) nativeInjectVideo(mediaPath, device)
-              else         nativeInjectImage(mediaPath, device)
-          }
-          while (running) { delay(1000) }
-          nativeStopInjection()
-      }
+        // Per-app injection if target specified
+        if (!targetPackage.isNullOrBlank()) {
+            val wrapProp = "wrap.$targetPackage"
+            RootManager.runCommand("setprop '$wrapProp' '$propVal'")
+            RootManager.runCommand("resetprop '$wrapProp' '$propVal' 2>/dev/null || true")
+        }
 
-      private fun findBinary(name: String): String? =
-          listOf("/system/bin", "/system/xbin", "/data/local/tmp", "/sbin", "/vendor/bin")
-              .map { File(it, name) }
-              .firstOrNull { it.exists() && it.canExecute() }
-              ?.absolutePath
-  }
-  
+        // Restart cameraserver so the wrap prop takes effect
+        RootManager.runCommands(
+            "setprop ctl.restart cameraserver",
+            "sleep 1"
+        )
+
+        // Force-stop and relaunch target app if specified
+        if (!targetPackage.isNullOrBlank()) {
+            RootManager.runCommand("am force-stop '$targetPackage'")
+        }
+
+        Log.d(TAG, "LD_PRELOAD injection set up")
+    }
+
+    private fun cleanupAllWrapProps() {
+        val systemTargets = listOf(
+            "wrap.cameraserver",
+            "wrap.android.hardware.camera.provider@2.4-service",
+            "wrap.android.hardware.camera.provider@2.5-service",
+            "wrap.android.hardware.camera.provider@2.6-service",
+            "vendor.camera.hal.vendor"
+        )
+        for (prop in systemTargets) {
+            RootManager.runCommand("setprop '$prop' '' 2>/dev/null || true")
+            RootManager.runCommand("resetprop --delete '$prop' 2>/dev/null || true")
+        }
+        if (!targetPackage.isNullOrBlank()) {
+            val wp = "wrap.$targetPackage"
+            RootManager.runCommand("setprop '$wp' '' 2>/dev/null || true")
+            RootManager.runCommand("resetprop --delete '$wp' 2>/dev/null || true")
+        }
+    }
+
+    // ── v4l2 ─────────────────────────────────────────────────────────
+
+    private fun tryLoadV4L2Module() {
+        RootManager.runCommands(
+            "modprobe v4l2loopback devices=1 video_nr=10 card_label=VCam exclusive_caps=1 2>/dev/null || true",
+            "insmod /vendor/lib/modules/v4l2loopback.ko   devices=1 2>/dev/null || true",
+            "insmod /system/lib/modules/v4l2loopback.ko   devices=1 2>/dev/null || true",
+            "insmod /system/lib64/modules/v4l2loopback.ko devices=1 2>/dev/null || true"
+        )
+    }
+
+    private fun tryStartV4L2(device: String): Boolean {
+        return try {
+            nativeStartFrameLoop(TARGET_W, TARGET_H, device)
+        } catch (e: Exception) {
+            Log.e(TAG, "v4l2 start failed: ${e.message}")
+            false
+        }
+    }
+
+    // ── Frame streaming ───────────────────────────────────────────────
+
+    /**
+     * Stream frames to v4l2 device AND shared file.
+     * For images: one conversion, then loop at 30fps.
+     * For videos: extract frames at ~30fps, convert, push.
+     */
+    private suspend fun streamFramesToV4L2(device: String) {
+        if (isVideo) streamVideo(pushToV4L2 = true)
+        else          streamImage(pushToV4L2 = true)
+    }
+
+    private suspend fun streamFramesToSharedFile() {
+        if (isVideo) streamVideo(pushToV4L2 = false)
+        else          streamImage(pushToV4L2 = false)
+    }
+
+    private suspend fun streamImage(pushToV4L2: Boolean) = withContext(Dispatchers.IO) {
+        val bitmap = loadAndTransformBitmap(mediaPath) ?: run {
+            Log.e(TAG, "Cannot load image: $mediaPath"); return@withContext
+        }
+        val yuyv = bitmapToYUYV(bitmap, TARGET_W, TARGET_H)
+        bitmap.recycle()
+
+        Log.d(TAG, "Image loaded → YUYV ${TARGET_W}×${TARGET_H}, ${yuyv.size} bytes")
+
+        // Push once; the v4l2 pump loop keeps writing it
+        nativeUpdateYUYVFrame(yuyv, TARGET_W, TARGET_H)
+
+        // Stay alive as long as injection is running
+        while (running && isActive) delay(500)
+    }
+
+    private suspend fun streamVideo(pushToV4L2: Boolean) = withContext(Dispatchers.IO) {
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(mediaPath)
+            val durationMs = retriever.extractMetadata(
+                MediaMetadataRetriever.METADATA_KEY_DURATION
+            )?.toLongOrNull() ?: 5000L
+
+            Log.d(TAG, "Video duration: ${durationMs}ms")
+
+            var posMs = 0L
+            val frameIntervalMs = 33L // ~30fps
+
+            while (running && isActive) {
+                val frameBitmap = retriever.getFrameAtTime(
+                    posMs * 1000L,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                )
+
+                if (frameBitmap != null) {
+                    val transformed = applyTransforms(frameBitmap)
+                    val yuyv = bitmapToYUYV(transformed, TARGET_W, TARGET_H)
+                    if (transformed !== frameBitmap) transformed.recycle()
+                    frameBitmap.recycle()
+
+                    nativeUpdateYUYVFrame(yuyv, TARGET_W, TARGET_H)
+                }
+
+                posMs += frameIntervalMs
+                if (posMs >= durationMs) posMs = 0L // loop
+
+                delay(frameIntervalMs)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Video stream error: ${e.message}")
+        } finally {
+            retriever.release()
+        }
+    }
+
+    // ── Bitmap helpers ────────────────────────────────────────────────
+
+    private fun loadAndTransformBitmap(path: String): Bitmap? {
+        val raw = try {
+            BitmapFactory.decodeFile(path) ?: return null
+        } catch (e: Exception) {
+            Log.e(TAG, "BitmapFactory failed: ${e.message}"); return null
+        }
+        return applyTransforms(raw)
+    }
+
+    private fun applyTransforms(src: Bitmap): Bitmap {
+        val needsRotate = rotation != 0
+        val needsMirror = mirror
+        if (!needsRotate && !needsMirror) return src
+
+        val matrix = Matrix()
+        if (needsRotate) matrix.postRotate(rotation.toFloat())
+        if (needsMirror) matrix.postScale(-1f, 1f, src.width / 2f, src.height / 2f)
+
+        return Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+    }
+
+    /**
+     * Convert any-size Bitmap → YUYV ByteArray at [outW]×[outH].
+     * YUYV = 2 bytes per pixel, packed Y0 U0 Y1 V0.
+     */
+    private fun bitmapToYUYV(src: Bitmap, outW: Int, outH: Int): ByteArray {
+        // Scale if needed
+        val bmp = if (src.width != outW || src.height != outH) {
+            Bitmap.createScaledBitmap(src, outW, outH, true)
+        } else src
+
+        val pixels = IntArray(outW * outH)
+        bmp.getPixels(pixels, 0, outW, 0, 0, outW, outH)
+        if (bmp !== src) bmp.recycle()
+
+        val yuyv = ByteArray(outW * outH * 2)
+        var idx = 0
+        var pi  = 0
+        while (pi < pixels.size - 1) {
+            val p0 = pixels[pi]
+            val p1 = pixels[pi + 1]
+
+            val r0 = (p0 shr 16) and 0xff
+            val g0 = (p0 shr  8) and 0xff
+            val b0 =  p0         and 0xff
+            val r1 = (p1 shr 16) and 0xff
+            val g1 = (p1 shr  8) and 0xff
+            val b1 =  p1         and 0xff
+
+            val y0 = ((66 * r0 + 129 * g0 + 25 * b0 + 128) shr 8) + 16
+            val y1 = ((66 * r1 + 129 * g1 + 25 * b1 + 128) shr 8) + 16
+            val u  = ((-38 * r0 - 74 * g0 + 112 * b0 + 128) shr 8) + 128
+            val v  = ((112 * r0 - 94 * g0 - 18 * b0 + 128) shr 8) + 128
+
+            yuyv[idx++] = y0.coerceIn(16, 235).toByte()
+            yuyv[idx++] = u .coerceIn(16, 240).toByte()
+            yuyv[idx++] = y1.coerceIn(16, 235).toByte()
+            yuyv[idx++] = v .coerceIn(16, 240).toByte()
+
+            pi += 2
+        }
+        return yuyv
+    }
+}

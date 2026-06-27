@@ -1,285 +1,445 @@
+/**
+ * vcam_inject.cpp
+ * LD_PRELOAD hook for system-wide camera injection.
+ *
+ * Loaded into cameraserver (system-wide) or target app process.
+ * Intercepts hw_get_module / hw_get_module_by_class → returns fake camera module.
+ * Reads YUYV frames from /data/local/tmp/vcam/frame.yuyv written by VCamService.
+ */
 #define _GNU_SOURCE
-  #include <dlfcn.h>
-  #include <android/log.h>
-  #include <stdio.h>
-  #include <stdlib.h>
-  #include <string.h>
-  #include <pthread.h>
-  #include <unistd.h>
-  #include <stdint.h>
+#include <dlfcn.h>
+#include <android/log.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
 
-  #define TAG "VCamInject"
-  #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-  #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define TAG "VCamInject"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-  #define VCAM_DIR    "/data/local/tmp/vcam"
-  #define VCAM_IMAGE  VCAM_DIR "/source.jpg"
+#define VCAM_DIR        "/data/local/tmp/vcam"
+#define VCAM_FRAME_YUV  VCAM_DIR "/frame.yuyv"
+#define VCAM_META       VCAM_DIR "/frame_info"
+#define VCAM_CONFIG     VCAM_DIR "/vcam_config"
 
-  /* ── AOSP hardware.h binary layout ──────────────────────────────────── */
-  typedef struct hw_module_methods_t {
-      int (*open)(const struct hw_module_t* module, const char* id,
-                  struct hw_device_t** device);
-  } hw_module_methods_t;
+/* ── AOSP hardware.h binary layout ──────────────────────────────────── */
+typedef struct hw_module_methods_t {
+    int (*open)(const struct hw_module_t* module, const char* id,
+                struct hw_device_t** device);
+} hw_module_methods_t;
 
-  typedef struct hw_module_t {
-      uint32_t tag;
-      uint16_t module_api_version;
-      uint16_t hal_api_version;
-      const char* id;
-      const char* name;
-      const char* author;
-      hw_module_methods_t* methods;
-      void* dso;
-  #ifdef __LP64__
-      uint64_t reserved[32-7];
-  #else
-      uint32_t reserved[32-7];
-  #endif
-  } hw_module_t;
+typedef struct hw_module_t {
+    uint32_t tag;
+    uint16_t module_api_version;
+    uint16_t hal_api_version;
+    const char* id;
+    const char* name;
+    const char* author;
+    hw_module_methods_t* methods;
+    void* dso;
+#ifdef __LP64__
+    uint64_t reserved[32-7];
+#else
+    uint32_t reserved[32-7];
+#endif
+} hw_module_t;
 
-  typedef struct hw_device_t {
-      uint32_t tag;
-      uint32_t version;
-      struct hw_module_t* module;
-  #ifdef __LP64__
-      uint64_t reserved[12];
-  #else
-      uint32_t reserved[12];
-  #endif
-      int (*close)(struct hw_device_t* device);
-  } hw_device_t;
+typedef struct hw_device_t {
+    uint32_t tag;
+    uint32_t version;
+    struct hw_module_t* module;
+#ifdef __LP64__
+    uint64_t reserved[12];
+#else
+    uint32_t reserved[12];
+#endif
+    int (*close)(struct hw_device_t* device);
+} hw_device_t;
 
-  /* ── Camera HAL 1 types (minimal) ───────────────────────────────────── */
-  typedef struct camera_memory {
-      void*  data;
-      size_t size;
-      void*  handle;
-      void  (*release)(struct camera_memory*);
-  } camera_memory_t;
+/* ── Camera HAL 1 types ──────────────────────────────────────────────── */
+typedef struct camera_memory {
+    void*  data;
+    size_t size;
+    void*  handle;
+    void  (*release)(struct camera_memory*);
+} camera_memory_t;
 
-  typedef void (*camera_notify_cb)(int32_t, int32_t, int32_t, void*);
-  typedef void (*camera_data_cb)(int32_t, camera_memory_t*, unsigned, void*);
-  typedef void (*camera_ts_cb)(int64_t, int32_t, camera_memory_t*, unsigned, void*);
-  typedef camera_memory_t* (*camera_request_memory_t)(int fd, size_t buf_size, unsigned int num_bufs, void* user);
-  struct preview_stream_ops;
+typedef void (*camera_notify_cb)(int32_t, int32_t, int32_t, void*);
+typedef void (*camera_data_cb)(int32_t, camera_memory_t*, unsigned, void*);
+typedef void (*camera_ts_cb)(int64_t, int32_t, camera_memory_t*, unsigned, void*);
+typedef camera_memory_t* (*camera_request_memory_t)(int fd, size_t buf_size, unsigned int num_bufs, void* user);
+struct preview_stream_ops;
 
-  typedef struct camera_device_ops_t {
-      int  (*set_preview_window)(struct camera_device*, struct preview_stream_ops*);
-      void (*set_callbacks)(struct camera_device*, camera_notify_cb, camera_data_cb,
-                            camera_ts_cb, camera_request_memory_t, void*);
-      void (*enable_msg_type)(struct camera_device*, int32_t);
-      void (*disable_msg_type)(struct camera_device*, int32_t);
-      int  (*msg_type_enabled)(struct camera_device*, int32_t);
-      int  (*start_preview)(struct camera_device*);
-      void (*stop_preview)(struct camera_device*);
-      int  (*preview_enabled)(struct camera_device*);
-      int  (*store_meta_data_in_buffers)(struct camera_device*, int);
-      int  (*start_recording)(struct camera_device*);
-      void (*stop_recording)(struct camera_device*);
-      int  (*recording_enabled)(struct camera_device*);
-      void (*release_recording_frame)(struct camera_device*, const void*);
-      int  (*auto_focus)(struct camera_device*);
-      int  (*cancel_auto_focus)(struct camera_device*);
-      int  (*take_picture)(struct camera_device*);
-      int  (*cancel_picture)(struct camera_device*);
-      int  (*set_parameters)(struct camera_device*, const char*);
-      char*(*get_parameters)(struct camera_device*);
-      void (*put_parameters)(struct camera_device*, char*);
-      int  (*send_command)(struct camera_device*, int32_t, int32_t, int32_t);
-      void (*release)(struct camera_device*);
-      int  (*dump)(struct camera_device*, int);
-  } camera_device_ops_t;
+typedef struct camera_device_ops_t {
+    int  (*set_preview_window)(struct camera_device*, struct preview_stream_ops*);
+    void (*set_callbacks)(struct camera_device*, camera_notify_cb, camera_data_cb,
+                          camera_ts_cb, camera_request_memory_t, void*);
+    void (*enable_msg_type)(struct camera_device*, int32_t);
+    void (*disable_msg_type)(struct camera_device*, int32_t);
+    int  (*msg_type_enabled)(struct camera_device*, int32_t);
+    int  (*start_preview)(struct camera_device*);
+    void (*stop_preview)(struct camera_device*);
+    int  (*preview_enabled)(struct camera_device*);
+    int  (*store_meta_data_in_buffers)(struct camera_device*, int);
+    int  (*start_recording)(struct camera_device*);
+    void (*stop_recording)(struct camera_device*);
+    int  (*recording_enabled)(struct camera_device*);
+    void (*release_recording_frame)(struct camera_device*, const void*);
+    int  (*auto_focus)(struct camera_device*);
+    int  (*cancel_auto_focus)(struct camera_device*);
+    int  (*take_picture)(struct camera_device*);
+    int  (*cancel_picture)(struct camera_device*);
+    int  (*set_parameters)(struct camera_device*, const char*);
+    char*(*get_parameters)(struct camera_device*);
+    void (*put_parameters)(struct camera_device*, char*);
+    int  (*send_command)(struct camera_device*, int32_t, int32_t, int32_t);
+    void (*release)(struct camera_device*);
+    int  (*dump)(struct camera_device*, int);
+} camera_device_ops_t;
 
-  typedef struct camera_device {
-      hw_device_t         common;
-      camera_device_ops_t* ops;
-      void*               priv;
-  } camera_device_t;
+typedef struct camera_device {
+    hw_device_t         common;
+    camera_device_ops_t* ops;
+    void*               priv;
+} camera_device_t;
 
-  /* ── Global state ────────────────────────────────────────────────────── */
-  typedef int (*hw_get_module_by_class_fn)(const char*, const char*, const hw_module_t**);
-  typedef int (*hw_get_module_fn)(const char*, const hw_module_t**);
+/* ── Real function pointers ─────────────────────────────────────────── */
+typedef int (*hw_get_module_by_class_fn)(const char*, const char*, const hw_module_t**);
+typedef int (*hw_get_module_fn)(const char*, const hw_module_t**);
+static hw_get_module_by_class_fn real_by_class = NULL;
+static hw_get_module_fn          real_get      = NULL;
 
-  static hw_get_module_by_class_fn real_by_class = NULL;
-  static hw_get_module_fn          real_get       = NULL;
+/* ── Per-device state ───────────────────────────────────────────────── */
+typedef struct {
+    camera_data_cb         data_cb;
+    camera_request_memory_t request_mem;
+    void*                  user;
+    volatile int           preview_running;
+    volatile int           recording_running;
+    pthread_t              preview_thread;
+    int                    width;
+    int                    height;
+    int                    rotation;   /* degrees: 0/90/180/270 */
+    int                    mirror;     /* 0 or 1 */
+} fake_cam_priv_t;
 
-  static camera_notify_cb        g_notify  = NULL;
-  static camera_data_cb          g_data    = NULL;
-  static camera_request_memory_t g_get_mem = NULL;
-  static void*                   g_user    = NULL;
-  static volatile int            g_preview = 0;
-  static volatile int            g_stop    = 0;
-  static pthread_t               g_thread  = 0;
+/* ── Frame reading from shared file ─────────────────────────────────── */
+static int g_frame_width  = 640;
+static int g_frame_height = 480;
 
-  /* ── Preview thread — delivers JPEG frames ───────────────────────────── */
-  static void* preview_thread(void* arg) {
-      (void)arg;
-      while (!g_stop) {
-          if (g_preview && g_data && g_get_mem) {
-              FILE* f = fopen(VCAM_IMAGE, "rb");
-              if (f) {
-                  fseek(f, 0, SEEK_END);
-                  long sz = ftell(f);
-                  fseek(f, 0, SEEK_SET);
-                  if (sz > 0 && sz < 10*1024*1024) {
-                      camera_memory_t* mem = g_get_mem(-1, (size_t)sz, 1, g_user);
-                      if (mem && mem->data) {
-                          if (fread(mem->data, 1, (size_t)sz, f) == (size_t)sz)
-                              g_data(0x080 /*CAMERA_MSG_COMPRESSED_IMAGE*/, mem, 0, g_user);
-                          mem->release(mem);
-                      }
-                  }
-                  fclose(f);
-              }
-          }
-          usleep(100000); /* 10 fps — low load */
-      }
-      return NULL;
-  }
+static void read_frame_meta(void) {
+    FILE* f = fopen(VCAM_META, "r");
+    if (!f) return;
+    int w = 640, h = 480;
+    fscanf(f, "%d %d", &w, &h);
+    fclose(f);
+    if (w > 0 && w <= 4096) g_frame_width  = w;
+    if (h > 0 && h <= 4096) g_frame_height = h;
+}
 
-  /* ── Fake camera device ops ──────────────────────────────────────────── */
-  static int fake_set_preview_window(camera_device_t* d, struct preview_stream_ops* w)
-      { (void)d;(void)w; return 0; }
+/**
+ * Read the latest YUYV frame from shared file.
+ * Returns number of bytes read, or 0 on failure.
+ */
+static size_t read_yuyv_frame(uint8_t* dst, size_t max_bytes) {
+    int fd = open(VCAM_FRAME_YUV, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, dst, max_bytes);
+    close(fd);
+    return (n > 0) ? (size_t)n : 0;
+}
 
-  static void fake_set_callbacks(camera_device_t* d, camera_notify_cb n,
-                                  camera_data_cb cb, camera_ts_cb ts,
-                                  camera_request_memory_t gm, void* u)
-      { (void)d;(void)ts; g_notify=n; g_data=cb; g_get_mem=gm; g_user=u; }
+/* ── Preview thread ─────────────────────────────────────────────────── */
+static void* preview_thread_fn(void* arg) {
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)arg;
+    read_frame_meta();
+    int w = g_frame_width;
+    int h = g_frame_height;
+    size_t frame_size = (size_t)(w * h * 2); /* YUYV: 2 bytes/pixel */
 
-  static void fake_enable_msg (camera_device_t* d, int32_t t) { (void)d;(void)t; }
-  static void fake_disable_msg(camera_device_t* d, int32_t t) { (void)d;(void)t; }
-  static int  fake_msg_enabled(camera_device_t* d, int32_t t) { (void)d;(void)t; return 0; }
+    uint8_t* frame_buf = (uint8_t*)malloc(frame_size);
+    if (!frame_buf) {
+        priv->preview_running = 0;
+        return NULL;
+    }
 
-  static int fake_start_preview(camera_device_t* d) {
-      (void)d; g_stop=0; g_preview=1;
-      pthread_create(&g_thread, NULL, preview_thread, NULL);
-      LOGI("VCam: preview started");
-      return 0;
-  }
-  static void fake_stop_preview(camera_device_t* d) {
-      (void)d; g_preview=0; g_stop=1;
-      if (g_thread) { pthread_join(g_thread,NULL); g_thread=0; }
-  }
-  static int  fake_preview_enabled(camera_device_t* d)          { (void)d; return g_preview; }
-  static int  fake_store_meta(camera_device_t* d, int e)         { (void)d;(void)e; return 0; }
-  static int  fake_start_rec(camera_device_t* d)                 { (void)d; return 0; }
-  static void fake_stop_rec(camera_device_t* d)                  { (void)d; }
-  static int  fake_rec_enabled(camera_device_t* d)               { (void)d; return 0; }
-  static void fake_rel_rec(camera_device_t* d, const void* f)    { (void)d;(void)f; }
-  static int  fake_auto_focus(camera_device_t* d)                { (void)d; return 0; }
-  static int  fake_cancel_af(camera_device_t* d)                 { (void)d; return 0; }
-  static int  fake_take_pic(camera_device_t* d)                  { (void)d; return 0; }
-  static int  fake_cancel_pic(camera_device_t* d)                { (void)d; return 0; }
-  static int  fake_set_params(camera_device_t* d, const char* p) { (void)d;(void)p; return 0; }
-  static char* fake_get_params(camera_device_t* d) {
-      (void)d;
-      return strdup("preview-size=640x480;picture-size=640x480;"
-                    "preview-format=jpeg;preview-frame-rate=10;"
-                    "picture-format=jpeg;jpeg-quality=90;");
-  }
-  static void fake_put_params(camera_device_t* d, char* p)       { (void)d; free(p); }
-  static int  fake_send_cmd(camera_device_t* d, int32_t c, int32_t a, int32_t b)
-      { (void)d;(void)c;(void)a;(void)b; return 0; }
-  static void fake_release(camera_device_t* d)  { fake_stop_preview(d); }
-  static int  fake_dump(camera_device_t* d, int fd) { (void)d;(void)fd; return 0; }
+    /* Default frame: gray */
+    for (size_t i = 0; i < frame_size; i += 4) {
+        frame_buf[i+0] = 128; /* Y */
+        frame_buf[i+1] = 128; /* U */
+        frame_buf[i+2] = 128; /* Y */
+        frame_buf[i+3] = 128; /* V */
+    }
 
-  static int fake_close(hw_device_t* dev) {
-      camera_device_t* cam = (camera_device_t*)dev;
-      fake_stop_preview(cam);
-      free(cam->ops);
-      free(cam);
-      return 0;
-  }
+    LOGI("Preview thread started: %dx%d", w, h);
 
-  static int fake_module_open(const hw_module_t* module, const char* id, hw_device_t** out) {
-      (void)id;
-      LOGI("VCam: camera open()");
-      camera_device_t* cam = (camera_device_t*)calloc(1, sizeof(*cam));
-      cam->common.tag    = 0x48574445u; /* HARDWARE_DEVICE_TAG */
-      cam->common.version= 0x0100;
-      cam->common.module = (hw_module_t*)module;
-      cam->common.close  = fake_close;
-      camera_device_ops_t* ops = (camera_device_ops_t*)calloc(1, sizeof(*ops));
-      ops->set_preview_window         = (int  (*)(struct camera_device*, struct preview_stream_ops*))fake_set_preview_window;
-      ops->set_callbacks              = (void (*)(struct camera_device*, camera_notify_cb, camera_data_cb, camera_ts_cb, camera_request_memory_t, void*))fake_set_callbacks;
-      ops->enable_msg_type            = (void (*)(struct camera_device*, int32_t))fake_enable_msg;
-      ops->disable_msg_type           = (void (*)(struct camera_device*, int32_t))fake_disable_msg;
-      ops->msg_type_enabled           = (int  (*)(struct camera_device*, int32_t))fake_msg_enabled;
-      ops->start_preview              = (int  (*)(struct camera_device*))fake_start_preview;
-      ops->stop_preview               = (void (*)(struct camera_device*))fake_stop_preview;
-      ops->preview_enabled            = (int  (*)(struct camera_device*))fake_preview_enabled;
-      ops->store_meta_data_in_buffers = (int  (*)(struct camera_device*, int))fake_store_meta;
-      ops->start_recording            = (int  (*)(struct camera_device*))fake_start_rec;
-      ops->stop_recording             = (void (*)(struct camera_device*))fake_stop_rec;
-      ops->recording_enabled          = (int  (*)(struct camera_device*))fake_rec_enabled;
-      ops->release_recording_frame    = (void (*)(struct camera_device*, const void*))fake_rel_rec;
-      ops->auto_focus                 = (int  (*)(struct camera_device*))fake_auto_focus;
-      ops->cancel_auto_focus          = (int  (*)(struct camera_device*))fake_cancel_af;
-      ops->take_picture               = (int  (*)(struct camera_device*))fake_take_pic;
-      ops->cancel_picture             = (int  (*)(struct camera_device*))fake_cancel_pic;
-      ops->set_parameters             = (int  (*)(struct camera_device*, const char*))fake_set_params;
-      ops->get_parameters             = (char*(*)(struct camera_device*))fake_get_params;
-      ops->put_parameters             = (void (*)(struct camera_device*, char*))fake_put_params;
-      ops->send_command               = (int  (*)(struct camera_device*, int32_t, int32_t, int32_t))fake_send_cmd;
-      ops->release                    = (void (*)(struct camera_device*))fake_release;
-      ops->dump                       = (int  (*)(struct camera_device*, int))fake_dump;
-      cam->ops = ops;
-      *out = &cam->common;
-      LOGI("VCam: camera device created");
-      return 0;
-  }
+    while (priv->preview_running) {
+        /* Try to read the real frame from the shared file */
+        size_t n = read_yuyv_frame(frame_buf, frame_size);
+        if (n == 0) {
+            /* Keep the previous frame if file not ready */
+        }
 
-  static hw_module_methods_t g_methods = { fake_module_open };
-  static hw_module_t g_fake_module = {
-      /* tag               */ 0x48574D4Fu,
-      /* module_api_version*/ 0x0100,
-      /* hal_api_version   */ 0x0100,
-      /* id                */ "camera",
-      /* name              */ "VCam Fake Camera",
-      /* author            */ "VCam",
-      /* methods           */ &g_methods,
-      /* dso               */ NULL,
-  };
+        if (priv->data_cb && priv->request_mem) {
+            /* Allocate camera memory and deliver frame */
+            camera_memory_t* mem = priv->request_mem(-1, frame_size, 1, priv->user);
+            if (mem && mem->data) {
+                memcpy(mem->data, frame_buf, frame_size);
+                /* CAMERA_MSG_PREVIEW_FRAME = 0x008 */
+                priv->data_cb(0x008, mem, 0, priv->user);
+                if (mem->release) mem->release(mem);
+            }
+        }
 
-  /* ── Constructor: resolve real functions ONCE at load time ───────────── */
-  __attribute__((constructor))
-  static void vcam_init(void) {
-      /* RTLD_NEXT finds the next definition in the link order               */
-      real_by_class = (hw_get_module_by_class_fn)dlsym(RTLD_NEXT, "hw_get_module_by_class");
-      real_get      = (hw_get_module_fn)         dlsym(RTLD_NEXT, "hw_get_module");
-      if (!real_by_class || !real_get) {
-          void* lh = dlopen("libhardware.so", RTLD_NOW | RTLD_NOLOAD);
-          if (!lh)  lh = dlopen("libhardware.so", RTLD_NOW | RTLD_GLOBAL);
-          if (lh) {
-              if (!real_by_class) real_by_class = (hw_get_module_by_class_fn)dlsym(lh, "hw_get_module_by_class");
-              if (!real_get)      real_get      = (hw_get_module_fn)         dlsym(lh, "hw_get_module");
-          }
-      }
-      LOGI("VCam init: by_class=%p get=%p", real_by_class, real_get);
-  }
+        /* ~30 fps */
+        usleep(33333);
+    }
 
-  /* ── Hooks ───────────────────────────────────────────────────────────── */
+    free(frame_buf);
+    LOGI("Preview thread stopped");
+    return NULL;
+}
 
-  /* CRITICAL: non-camera classes MUST go to the real function.            */
-  /* If real_fn is NULL we return -1 rather than returning our fake module.*/
-  int hw_get_module_by_class(const char* class_name, const char* inst,
-                               const hw_module_t** module) {
-      if (class_name && strcmp(class_name, "camera") == 0) {
-          LOGI("VCam: intercepted camera (by_class)");
-          *module = &g_fake_module;
-          return 0;
-      }
-      if (real_by_class) return real_by_class(class_name, inst, module);
-      return -1; /* safe fallback — module not found */
-  }
+/* ── Fake camera device ops ─────────────────────────────────────────── */
+static int fake_set_preview_window(struct camera_device* dev,
+                                    struct preview_stream_ops* window) {
+    (void)dev; (void)window;
+    return 0;
+}
 
-  int hw_get_module(const char* id, const hw_module_t** module) {
-      if (id && strcmp(id, "camera") == 0) {
-          LOGI("VCam: intercepted camera (get_module)");
-          *module = &g_fake_module;
-          return 0;
-      }
-      if (real_get) return real_get(id, module);
-      return -1;
-  }
-  
+static void fake_set_callbacks(struct camera_device* dev,
+                                camera_notify_cb notify_cb,
+                                camera_data_cb data_cb,
+                                camera_ts_cb ts_cb,
+                                camera_request_memory_t get_memory,
+                                void* user) {
+    (void)notify_cb; (void)ts_cb;
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)dev->priv;
+    if (priv) {
+        priv->data_cb    = data_cb;
+        priv->request_mem = get_memory;
+        priv->user       = user;
+    }
+}
+
+static void fake_enable_msg_type(struct camera_device* dev, int32_t msg_type) {
+    (void)dev; (void)msg_type;
+}
+static void fake_disable_msg_type(struct camera_device* dev, int32_t msg_type) {
+    (void)dev; (void)msg_type;
+}
+static int fake_msg_type_enabled(struct camera_device* dev, int32_t msg_type) {
+    (void)dev; (void)msg_type; return 1;
+}
+
+static int fake_start_preview(struct camera_device* dev) {
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)dev->priv;
+    if (!priv || priv->preview_running) return 0;
+    priv->preview_running = 1;
+    pthread_create(&priv->preview_thread, NULL, preview_thread_fn, priv);
+    LOGI("VCam: preview started");
+    return 0;
+}
+
+static void fake_stop_preview(struct camera_device* dev) {
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)dev->priv;
+    if (!priv || !priv->preview_running) return;
+    priv->preview_running = 0;
+    pthread_join(priv->preview_thread, NULL);
+    LOGI("VCam: preview stopped");
+}
+
+static int fake_preview_enabled(struct camera_device* dev) {
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)dev->priv;
+    return (priv && priv->preview_running) ? 1 : 0;
+}
+
+static int fake_store_meta(struct camera_device* dev, int enable) {
+    (void)dev; (void)enable; return 0;
+}
+static int fake_start_recording(struct camera_device* dev) {
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)dev->priv;
+    if (priv) priv->recording_running = 1;
+    return 0;
+}
+static void fake_stop_recording(struct camera_device* dev) {
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)dev->priv;
+    if (priv) priv->recording_running = 0;
+}
+static int fake_recording_enabled(struct camera_device* dev) {
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)dev->priv;
+    return (priv && priv->recording_running) ? 1 : 0;
+}
+static void fake_release_recording_frame(struct camera_device* dev, const void* opaque) {
+    (void)dev; (void)opaque;
+}
+static int  fake_auto_focus(struct camera_device* dev)        { (void)dev; return 0; }
+static int  fake_cancel_auto_focus(struct camera_device* dev) { (void)dev; return 0; }
+static int  fake_take_picture(struct camera_device* dev) {
+    /* Deliver a JPEG snapshot using the preview frame */
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)dev->priv;
+    if (priv && priv->data_cb && priv->request_mem) {
+        read_frame_meta();
+        size_t frame_size = (size_t)(g_frame_width * g_frame_height * 2);
+        uint8_t* buf = (uint8_t*)malloc(frame_size);
+        if (buf) {
+            read_yuyv_frame(buf, frame_size);
+            camera_memory_t* mem = priv->request_mem(-1, frame_size, 1, priv->user);
+            if (mem && mem->data) {
+                memcpy(mem->data, buf, frame_size);
+                /* CAMERA_MSG_RAW_IMAGE = 0x080 */
+                priv->data_cb(0x080, mem, 0, priv->user);
+                if (mem->release) mem->release(mem);
+            }
+            free(buf);
+        }
+    }
+    return 0;
+}
+static int  fake_cancel_picture(struct camera_device* dev)    { (void)dev; return 0; }
+
+static int  fake_set_parameters(struct camera_device* dev, const char* params) {
+    (void)dev; (void)params; return 0;
+}
+static char* fake_get_parameters(struct camera_device* dev) {
+    (void)dev;
+    /* Return minimal camera parameters */
+    static char params[] =
+        "preview-size=640x480;"
+        "preview-size-values=1920x1080,1280x720,640x480,320x240;"
+        "picture-size=1920x1080;"
+        "picture-format=jpeg;"
+        "jpeg-quality=90;"
+        "preview-format=yuv422i-yuyv;"
+        "preview-frame-rate=30;";
+    return params;
+}
+static void  fake_put_parameters(struct camera_device* dev, char* params) { (void)dev; (void)params; }
+static int   fake_send_command(struct camera_device* dev, int32_t cmd, int32_t arg1, int32_t arg2) {
+    (void)dev; (void)cmd; (void)arg1; (void)arg2; return 0;
+}
+static void  fake_release(struct camera_device* dev) {
+    fake_stop_preview(dev);
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)dev->priv;
+    if (priv) {
+        free(priv);
+        dev->priv = NULL;
+    }
+}
+static int   fake_dump(struct camera_device* dev, int fd) { (void)dev; (void)fd; return 0; }
+
+static camera_device_ops_t g_fake_ops = {
+    .set_preview_window       = fake_set_preview_window,
+    .set_callbacks            = fake_set_callbacks,
+    .enable_msg_type          = fake_enable_msg_type,
+    .disable_msg_type         = fake_disable_msg_type,
+    .msg_type_enabled         = fake_msg_type_enabled,
+    .start_preview            = fake_start_preview,
+    .stop_preview             = fake_stop_preview,
+    .preview_enabled          = fake_preview_enabled,
+    .store_meta_data_in_buffers = fake_store_meta,
+    .start_recording          = fake_start_recording,
+    .stop_recording           = fake_stop_recording,
+    .recording_enabled        = fake_recording_enabled,
+    .release_recording_frame  = fake_release_recording_frame,
+    .auto_focus               = fake_auto_focus,
+    .cancel_auto_focus        = fake_cancel_auto_focus,
+    .take_picture             = fake_take_picture,
+    .cancel_picture           = fake_cancel_picture,
+    .set_parameters           = fake_set_parameters,
+    .get_parameters           = fake_get_parameters,
+    .put_parameters           = fake_put_parameters,
+    .send_command             = fake_send_command,
+    .release                  = fake_release,
+    .dump                     = fake_dump,
+};
+
+/* ── Fake module: open function ─────────────────────────────────────── */
+static int fake_camera_open(const struct hw_module_t* module,
+                             const char* id,
+                             struct hw_device_t** device) {
+    LOGI("VCam: fake_camera_open(%s)", id ? id : "null");
+
+    camera_device_t* cam = (camera_device_t*)calloc(1, sizeof(camera_device_t));
+    if (!cam) return -ENOMEM;
+
+    fake_cam_priv_t* priv = (fake_cam_priv_t*)calloc(1, sizeof(fake_cam_priv_t));
+    if (!priv) { free(cam); return -ENOMEM; }
+
+    read_frame_meta();
+    priv->width  = g_frame_width;
+    priv->height = g_frame_height;
+
+    cam->common.tag     = 0x48574456; /* HWDV */
+    cam->common.version = 1;
+    cam->common.module  = (struct hw_module_t*)module;
+    cam->common.close   = NULL;
+    cam->ops            = &g_fake_ops;
+    cam->priv           = priv;
+
+    *device = &cam->common;
+    return 0;
+}
+
+static hw_module_methods_t g_methods = {
+    .open = fake_camera_open,
+};
+
+static hw_module_t g_fake_module = {
+    /* tag                */ 0x48574D4F, /* HWMO */
+    /* module_api_version */ 0x0100,
+    /* hal_api_version    */ 0x0100,
+    /* id                 */ "camera",
+    /* name               */ "VCam Virtual Camera",
+    /* author             */ "VCam",
+    /* methods            */ &g_methods,
+    /* dso                */ NULL,
+};
+
+/* ── Constructor: resolve real functions ONCE at load time ───────────── */
+__attribute__((constructor))
+static void vcam_init(void) {
+    real_by_class = (hw_get_module_by_class_fn)dlsym(RTLD_NEXT, "hw_get_module_by_class");
+    real_get      = (hw_get_module_fn)         dlsym(RTLD_NEXT, "hw_get_module");
+    if (!real_by_class || !real_get) {
+        void* lh = dlopen("libhardware.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!lh) lh = dlopen("libhardware.so", RTLD_NOW | RTLD_GLOBAL);
+        if (lh) {
+            if (!real_by_class)
+                real_by_class = (hw_get_module_by_class_fn)dlsym(lh, "hw_get_module_by_class");
+            if (!real_get)
+                real_get = (hw_get_module_fn)dlsym(lh, "hw_get_module");
+        }
+    }
+    LOGI("VCamInject loaded: by_class=%p get=%p", real_by_class, real_get);
+    read_frame_meta();
+}
+
+/* ── Hooks ───────────────────────────────────────────────────────────── */
+int hw_get_module_by_class(const char* class_name, const char* inst,
+                            const hw_module_t** module) {
+    if (class_name && strcmp(class_name, "camera") == 0) {
+        LOGI("VCam: intercepted hw_get_module_by_class(camera)");
+        *module = &g_fake_module;
+        return 0;
+    }
+    if (real_by_class) return real_by_class(class_name, inst, module);
+    return -1;
+}
+
+int hw_get_module(const char* id, const hw_module_t** module) {
+    if (id && strcmp(id, "camera") == 0) {
+        LOGI("VCam: intercepted hw_get_module(camera)");
+        *module = &g_fake_module;
+        return 0;
+    }
+    if (real_get) return real_get(id, module);
+    return -1;
+}
